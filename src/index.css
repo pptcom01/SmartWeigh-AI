@@ -1,0 +1,81 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    font-family: 'Kanit', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    color: #0f172a;
+    background-color: #f8fafc;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  input, select, textarea, button {
+    font-family: inherit;
+  }
+}
+
+/* Custom Table Scrollbars */
+.table-scroll::-webkit-scrollbar {
+  height: 8px;
+  width: 6px;
+}
+.table-scroll::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+.table-scroll::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 9999px;
+}
+.table-scroll::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* Sticky column helpers with precise widths and elevation shadows */
+.sticky-col-checkbox {
+  position: sticky;
+  left: 0;
+  width: 44px;
+  min-width: 44px;
+  max-width: 44px;
+}
+
+.sticky-col-tr {
+  position: sticky;
+  left: 44px;
+  width: 146px;
+  min-width: 146px;
+  max-width: 146px;
+}
+
+.sticky-col-actions {
+  position: sticky;
+  right: 0;
+  width: 104px;
+  min-width: 104px;
+  max-width: 104px;
+}
+
+@keyframes scanLineAnimation {
+  0% { top: 0%; opacity: 0.8; }
+  50% { top: 96%; opacity: 1; }
+  100% { top: 0%; opacity: 0.8; }
+}
+
+.animate-scan-line {
+  animation: scanLineAnimation 2.2s ease-in-out infinite;
+}
+
+/* Smooth fade-in animation */
+@keyframes fadeInAnim {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-fadeIn {
+  animation: fadeInAnim 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* Tabular number styling */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}

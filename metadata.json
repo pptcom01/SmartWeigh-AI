@@ -1,0 +1,6 @@
+{
+  "name": "AutoStore & Order Management System with Gemini AI",
+  "description": "ระบบจัดการข้อมูลร้านค้า คู่ค้า และประวัติการสั่งซื้ออัตโนมัติ พร้อมสแกนบิลและตั๋วชั่งด้วย Gemini AI ครอบคลุม 39 คอลัมน์",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
