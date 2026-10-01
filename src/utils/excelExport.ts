@@ -134,9 +134,11 @@ export function exportAllDataToExcel(orders: OrderRecord[], stores: StoreMerchan
         "สถานที่ส่ง": p.deliveryLocation || '-',
         "ผู้สั่งซื้อ": p.orderedBy || '-',
         "ผู้อนุมัติ": p.approvedBy || '-',
-        "หมายเหตุ": recon.hasUnitMismatch 
-          ? `${p.notes ? p.notes + ' ' : ''}[⚠️ มีตั๋วหน่วยไม่ตรงกับ PO: ${recon.unitMismatchWarnings?.join('; ')}]` 
-          : (p.notes || '')
+        "หมายเหตุ": [
+          p.notes || '',
+          recon.isMultiItem ? `[PO หลายรายการ (${p.items.length} รายการ): ความคืบหน้าคิดตามมูลค่าส่งมอบ]` : '',
+          recon.hasUnitMismatch ? `[⚠️ ตั๋วหน่วยไม่ตรงกับ PO: ${recon.unitMismatchWarnings?.join('; ')}]` : ''
+        ].filter(Boolean).join(' ')
       };
     });
     const poSheet = XLSX.utils.json_to_sheet(poRows);

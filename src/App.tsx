@@ -25,6 +25,35 @@ const STORAGE_ORDERS_KEY = 'autostore_real_orders_v2';
 const STORAGE_STORES_KEY = 'autostore_real_stores_v2';
 const STORAGE_POS_KEY = 'autostore_real_pos_v2';
 
+// Helper to recalculate store financials strictly from actual order records (Single Source of Truth)
+const syncStoreFinancials = (storesList: StoreMerchant[], ordersList: OrderRecord[]): StoreMerchant[] => {
+  return storesList.map(store => {
+    const storeOrders = ordersList.filter(
+      o => o.storeId === store.id || (o.col8 && o.col8.trim().toLowerCase() === store.name.trim().toLowerCase())
+    );
+    let totalPurchases = 0;
+    let totalPaid = 0;
+    let totalDebt = 0;
+    let lastDate = store.lastOrderDate || '';
+    storeOrders.forEach(o => {
+      if (o.docType === 'dest_weighbridge') return;
+      totalPurchases += Number(o.col29) || 0;
+      totalPaid += Number(o.col35) || 0;
+      totalDebt += Number(o.col36) || 0;
+      if (o.col7 && o.col7 > lastDate) lastDate = o.col7;
+    });
+
+    return {
+      ...store,
+      totalOrders: storeOrders.length,
+      totalPurchases,
+      totalPaid,
+      totalDebt,
+      lastOrderDate: lastDate || store.lastOrderDate
+    };
+  });
+};
+
 export default function App() {
   // Main Data States with clean persistence
   const [orders, setOrders] = useState<OrderRecord[]>(() => {
@@ -168,11 +197,58 @@ export default function App() {
       return;
     }
 
+    // Auto-match Destination Weighbridge tickets directly into existing origin DO / Weighbridge record
+    if (data.docType === 'dest_weighbridge') {
+      const cleanPlate = (data.col10 || '').replace(/[^0-9ก-ฮa-zA-Z]/g, '');
+      const refDO = (data.referenceDocNo || data.col6 || '').trim().toLowerCase();
+
+      const candidate = orders.find(ord => {
+        if (ord.docType === 'dest_weighbridge' || ord.docType === 'tax_invoice') return false;
+        if (Number(ord.col18) > 0) return false; // Already has destination weight
+
+        const ordPlate = (ord.col10 || '').replace(/[^0-9ก-ฮa-zA-Z]/g, '');
+        const ordDO = (ord.col6 || '').trim().toLowerCase();
+
+        const matchPlate = cleanPlate && ordPlate && (cleanPlate === ordPlate || ordPlate.includes(cleanPlate) || cleanPlate.includes(ordPlate));
+        const matchRefDO = refDO && ordDO && (ordDO.includes(refDO) || refDO.includes(ordDO));
+
+        return matchPlate || matchRefDO;
+      });
+
+      if (candidate) {
+        const grossD = Number(data.col18) || 0;
+        const tareD = Number(data.col19) || 0;
+        const netD = Number(data.col20) || Math.max(0, grossD - tareD);
+        const netO = Number(candidate.col15) || 0;
+        const diff = (netO > 0 && netD > 0) ? (netO - netD) : 0;
+
+        const updatedCandidate: OrderRecord = {
+          ...candidate,
+          col16: data.col16 || data.col7 || new Date().toISOString().split('T')[0],
+          col17: data.col17 || data.col6 || '',
+          col18: grossD,
+          col19: tareD,
+          col20: netD,
+          col21: diff,
+          col38: candidate.col38 
+            ? `${candidate.col38} | ชนตั๋วปลายทาง: ${data.col17 || data.col6 || ''}` 
+            : `ชนตั๋วปลายทาง: ${data.col17 || data.col6 || ''}`
+        };
+
+        setVerifyOrderData(updatedCandidate);
+        setVerifyImage(imageBase64);
+        setVerifyStoreSuggestion(storeSuggestion);
+        setIsVerifyOpen(true);
+        showToast(`AI จับคู่ตั๋วปลายทางเข้ากับ ${candidate.col1} (ทะเบียน ${candidate.col10}) สำเร็จ! กรุณาตรวจสอบ`);
+        return;
+      }
+    }
+
     setVerifyOrderData(data);
     setVerifyImage(imageBase64);
     setVerifyStoreSuggestion(storeSuggestion);
     setIsVerifyOpen(true);
-    showToast('Gemini AI สแกนใบส่งของสำเร็จ! กรุณาตรวจสอบข้อมูล');
+    showToast('Gemini AI สแกนเอกสารสำเร็จ! กรุณาตรวจสอบข้อมูล');
   };
 
   // Switch from VerifyModal to POEditModal when user selects or detects PO
@@ -187,34 +263,35 @@ export default function App() {
 
   // Save verified order (either new or updated)
   const handleSaveOrder = (order: OrderRecord, storeToSave?: StoreMerchant) => {
+    let nextOrders: OrderRecord[] = [];
     setOrders(prev => {
       const idx = prev.findIndex(o => o.id === order.id);
       if (idx >= 0) {
-        const copy = [...prev];
-        copy[idx] = order;
-        return copy;
+        nextOrders = [...prev];
+        nextOrders[idx] = order;
+      } else {
+        nextOrders = [order, ...prev];
       }
-      return [order, ...prev];
+      return nextOrders;
     });
 
-    // If store should be saved or updated in directory
-    if (storeToSave) {
-      setStores(prev => {
-        const existingIdx = prev.findIndex(s => s.name.trim().toLowerCase() === storeToSave.name.trim().toLowerCase());
+    // Sync store directory accurately without double counting or inflation
+    setStores(prev => {
+      let nextStores = [...prev];
+      if (storeToSave) {
+        const existingIdx = nextStores.findIndex(s => s.name.trim().toLowerCase() === storeToSave.name.trim().toLowerCase());
         if (existingIdx >= 0) {
-          const updated = [...prev];
-          updated[existingIdx] = {
-            ...updated[existingIdx],
-            totalOrders: updated[existingIdx].totalOrders + 1,
-            totalPurchases: updated[existingIdx].totalPurchases + order.col29,
-            totalDebt: updated[existingIdx].totalDebt + order.col36,
-            lastOrderDate: order.col7
+          nextStores[existingIdx] = {
+            ...nextStores[existingIdx],
+            ...storeToSave,
+            id: nextStores[existingIdx].id // preserve existing store ID
           };
-          return updated;
+        } else {
+          nextStores = [storeToSave, ...nextStores];
         }
-        return [storeToSave, ...prev];
-      });
-    }
+      }
+      return syncStoreFinancials(nextStores, nextOrders.length > 0 ? nextOrders : [order, ...orders]);
+    });
 
     showToast('บันทึกข้อมูลตั๋วชั่ง/คำสั่งซื้อเรียบร้อยแล้ว!');
   };
@@ -330,21 +407,27 @@ export default function App() {
       col1: order.col1 + '-COPY',
       createdAt: new Date().toISOString()
     };
-    setOrders(prev => [duplicated, ...prev]);
+    const nextOrders = [duplicated, ...orders];
+    setOrders(nextOrders);
+    setStores(prev => syncStoreFinancials(prev, nextOrders));
     showToast(`คัดลอกรายการ ${order.col1} สำเร็จ!`);
   };
 
   // Delete order
   const handleDeleteOrder = (id: string) => {
     if (confirm('คุณต้องการลบรายการเอกสารนี้หรือไม่?')) {
-      setOrders(prev => prev.filter(o => o.id !== id));
+      const nextOrders = orders.filter(o => o.id !== id);
+      setOrders(nextOrders);
+      setStores(prev => syncStoreFinancials(prev, nextOrders));
       showToast('ลบรายการเรียบร้อยแล้ว');
     }
   };
 
   // Update order inline
   const handleUpdateOrder = (updatedOrder: OrderRecord) => {
-    setOrders(prev => prev.map(o => o.id === updatedOrder.id ? updatedOrder : o));
+    const nextOrders = orders.map(o => o.id === updatedOrder.id ? updatedOrder : o);
+    setOrders(nextOrders);
+    setStores(prev => syncStoreFinancials(prev, nextOrders));
     showToast('อัปเดตรายการเรียบร้อยแล้ว');
   };
 

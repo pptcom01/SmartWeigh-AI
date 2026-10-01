@@ -15,6 +15,42 @@ interface POScanModalProps {
   onScanComplete: (poData: Partial<PurchaseOrder>, imageBase64: string) => void;
 }
 
+// Helper to scale down oversized mobile photos to keep payloads light and crisp
+const optimizeImageForAI = (file: File, maxDim = 1800, quality = 0.85): Promise<string> => {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const rawData = e.target?.result as string;
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > maxDim || height > maxDim) {
+          if (width > height) {
+            height = Math.round((height * maxDim) / width);
+            width = maxDim;
+          } else {
+            width = Math.round((width * maxDim) / height);
+            height = maxDim;
+          }
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, width, height);
+          resolve(canvas.toDataURL('image/jpeg', quality));
+        } else {
+          resolve(rawData);
+        }
+      };
+      img.onerror = () => resolve(rawData);
+      img.src = rawData;
+    };
+    reader.readAsDataURL(file);
+  });
+};
+
 export const POScanModal: React.FC<POScanModalProps> = ({
   isOpen,
   onClose,
@@ -28,7 +64,7 @@ export const POScanModal: React.FC<POScanModalProps> = ({
 
   if (!isOpen) return null;
 
-  const handleFileChange = (file: File) => {
+  const handleFileChange = async (file: File) => {
     if (!file.type.startsWith('image/') && !file.type.includes('pdf')) {
       setScanError('กรุณาเลือกไฟล์รูปภาพ (PNG, JPG, WebP) หรือเอกสาร');
       return;
@@ -37,11 +73,16 @@ export const POScanModal: React.FC<POScanModalProps> = ({
     setSelectedFile(file);
     setScanError(null);
 
-    const reader = new FileReader();
-    reader.onload = () => {
-      setPreviewUrl(reader.result as string);
-    };
-    reader.readAsDataURL(file);
+    try {
+      const optimizedBase64 = await optimizeImageForAI(file);
+      setPreviewUrl(optimizedBase64);
+    } catch {
+      const reader = new FileReader();
+      reader.onload = () => {
+        setPreviewUrl(reader.result as string);
+      };
+      reader.readAsDataURL(file);
+    }
   };
 
   const handleDrop = (e: React.DragEvent) => {

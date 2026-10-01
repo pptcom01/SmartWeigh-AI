@@ -12,17 +12,29 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json({ limit: '15mb' }));
-app.use(express.urlencoded({ extended: true, limit: '15mb' }));
+// Enable reverse proxy trust behind Cloud Run / AI Studio load balancers
+app.set('trust proxy', 1);
+
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // In-memory rate limiting to prevent Denial-of-Service and Gemini API quota exhaustion
 const scanRateLimitMap = new Map<string, { count: number; resetTime: number }>();
 const SCAN_WINDOW_MS = 60 * 1000; // 1-minute sliding window
 const MAX_SCANS_PER_WINDOW = 20; // 20 requests per minute per IP
 
+// Periodically purge expired rate-limit records every 5 minutes to prevent memory leak
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, record] of scanRateLimitMap.entries()) {
+    if (now > record.resetTime) {
+      scanRateLimitMap.delete(ip);
+    }
+  }
+}, 5 * 60 * 1000);
+
 const rateLimitScan = (req: Request, res: Response, next: () => void) => {
-  const forwarded = req.headers['x-forwarded-for'];
-  const clientIp = typeof forwarded === 'string' ? forwarded.split(',')[0].trim() : req.socket.remoteAddress || 'unknown';
+  const clientIp = req.ip || (typeof req.headers['x-forwarded-for'] === 'string' ? req.headers['x-forwarded-for'].split(',')[0].trim() : req.socket.remoteAddress) || 'unknown';
   const now = Date.now();
   const record = scanRateLimitMap.get(clientIp);
 
@@ -182,8 +194,30 @@ app.post('/api/scan-bill', rateLimitScan, async (req: Request, res: Response) =>
   * col4: เลขที่ใบสั่งซื้อ (PO หากมีระบุหรือเขียนลายมือไว้บนตั๋วชั่ง)
   * referenceSource: ระบุแหล่งที่พบเลขอ้างอิง ('form_field', 'notes', หรือ 'handwritten')
   * col38: หมายเหตุ (บันทึกข้อความอ้างอิงหรือลายมือที่พบบนตั๋วชั่ง)
-  * col24, col25, col27, col28, col29: ราคา/ค่าบรรทุก (หากระบุ)
+  * col24, col25, col27, col28, col29: ราคา/ค่าบรรทุก (เฉพาะกรณีมีพิมพ์หรือเขียนระบุจริงบนตั๋วชั่ง หากไม่ระบุให้ใส่ 0 เพราะการคิดราคาจะคำนวณในระบบ RR)
+  * โซน 6 (การชำระเงิน col30 - col36): ตั๋วชั่งเป็นเอกสารหน้างานไม่มีข้อมูลการเงิน ให้ใส่ 0 ทั้งหมด และ col30 ให้ใส่ '-'
   * โซน 4 (น้ำหนักปลายทาง col16, col17, col18, col19, col20, col21): ให้ใส่ 0 ทั้งหมด ห้ามคัดลอกตัวเลขจากโซน 3 มาใส่เด็ดขาด`;
+      } else if (targetDocType === 'dest_weighbridge') {
+        specificTargetInstructions = `
+[คำสั่งพิเศษจากผู้ใช้งาน]: ผู้ใช้ระบุว่านี่คือ "ตั๋วชั่งน้ำหนักรถบรรทุกปลายทาง (dest_weighbridge)":
+- บังคับให้ตั้งค่า docType = 'dest_weighbridge'
+- เอกสารนี้คือตั๋วชั่งน้ำหนักหน้างานปลายทาง เพื่อนำไปจับคู่ลง [โซน 4]
+- โฟกัสสูงสุดที่:
+  * col17: เลขที่ตั๋วชั่งปลายทาง
+  * col16: วันที่ชั่งปลายทาง (YYYY-MM-DD)
+  * col18: น้ำหนักชั่งเข้าปลายทาง (Gross ปลายทาง) กก.
+  * col19: น้ำหนักชั่งออกปลายทาง (Tare ปลายทาง) กก.
+  * col20: น้ำหนักสุทธิปลายทาง (Net ปลายทาง = col18 - col19) กก.
+  * col10: ทะเบียนรถบรรทุก (สำคัญมาก ใช้สำหรับจับคู่กับเที่ยวรถต้นทาง)
+  * referenceDocNo: เลขที่ใบส่งของ หรือ เลขที่ตั๋วชั่งต้นทางที่อ้างอิงถึง
+  * col6: เลขที่ตั๋วปลายทางนี้ (ใส่เลขเดียวกันกับ col17)
+  * col7: วันที่ชั่ง (ใส่วันที่เดียวกันกับ col16)
+  * col8: ผู้จำหน่าย / แหล่งสินค้าต้นทาง
+  * col11: รายการสินค้า
+  * col37: สถานที่ชั่งปลายทาง / ไซต์งาน
+  * col38: หมายเหตุบนตั๋วชั่งปลายทาง
+  * โซน 3 (col13, col14, col15): ใส่ 0 (เพราะเป็นตั๋วปลายทาง ไม่ใช่ต้นทาง)
+  * โซน 5 และ 6: ใส่ 0`;
       } else if (targetDocType === 'delivery_order') {
         specificTargetInstructions = `
 [คำสั่งพิเศษจากผู้ใช้งาน]: ผู้ใช้ระบุว่านี่คือ "ใบส่งสินค้า / ใบส่งของทั่วไป หรือ ใบส่งคอนกรีตผสมเสร็จ (delivery_order)":
@@ -201,12 +235,14 @@ app.post('/api/scan-bill', rateLimitScan, async (req: Request, res: Response) =>
   * col12: สเปก / ขนาด / KSC / Slump
   * col22: ปริมาณสินค้า (เช่น จำนวนเส้น, ถุง, หรือคิว m3)
   * col23: หน่วยนับจริง (เส้น, ถุง, ถัง, แผ่น, กล่อง, ม้วน, ชุด, คิว)
-  * col24: ราคาต่อหน่วย (หากมี)
-  * col25: รวมค่าสินค้า
-  * col29: รวมทั้งสิ้น
+  * col24: ราคาต่อหน่วย (หากมีพิมพ์ในบิลส่งของ)
+  * col25: รวมค่าสินค้า (หากมี)
+  * col29: รวมทั้งสิ้น (หากมี)
   * col38: หมายเหตุ (บันทึกข้อความอ้างอิงหรือลายมือที่พบ)
   * lineItems: รายการสินค้าทั้งหมดในใบส่งของ
-  * โซน 3 และ 4 (น้ำหนักชั่งต้นทางปลายทาง): ใส่ 0`;
+  * โซน 6 (การชำระเงิน col30 - col36): ให้ใส่ 0 ทั้งหมด (เว้นแต่เป็นใบเสร็จรับเงิน/บิลเงินสดที่มีการชำระเงินแล้วจริง)
+  * โซน 3 (น้ำหนักต้นทาง col13, col14, col15): สำหรับสินค้าทั่วไปที่ไม่ชั่งน้ำหนักให้ใส่ 0 แต่หากในเอกสารนี้มีตัวเลขตารางชั่งน้ำหนักรถบรรทุก เช่น Gross (หนักเข้า), Tare (เบาออก), Net (สุทธิ กก.) พิมพ์อยู่ด้วย ให้สกัดตัวเลขน้ำหนักจริงเข้า col13, col14, col15 ด้วยเสมอ
+  * โซน 4 (น้ำหนักปลายทาง): ใส่ 0`;
       } else if (targetDocType === 'concrete') {
         specificTargetInstructions = `
 [คำสั่งพิเศษจากผู้ใช้งาน]: ผู้ใช้ระบุว่านี่คือ "ใบส่งคอนกรีตผสมเสร็จ (delivery_order)":
@@ -426,7 +462,7 @@ ${!specificTargetInstructions ? `กรุณาตรวจสอบรูป�
         parsedData.col4 = parsedData.referenceDocNo;
       }
       if (!parsedData.col4 && parsedData.col38) {
-        const poMatch = /(?:PO|ใบสั่งซื้อ|P[/.]?O[.]?)\s*[:#№.\s-]*([A-Za-z0-9\-_/]+)/i.exec(parsedData.col38);
+        const poMatch = /(?:PO|ใบสั่งซื้อ|สั่งซื้อ|P[/.]?O[.]?|Ref(?:\s*PO)?|อ้างอิง(?:\s*PO)?|ตาม(?:\s*PO)?|สัญญา)\s*[:#№.\s-]*([A-Za-z0-9\-_/]+)/i.exec(parsedData.col38);
         if (poMatch && poMatch[1]) {
           parsedData.col4 = poMatch[1].trim();
           parsedData.referenceDocNo = poMatch[1].trim();
@@ -435,12 +471,12 @@ ${!specificTargetInstructions ? `กรุณาตรวจสอบรูป�
       }
     } else if (parsedData.docType === 'weighbridge') {
       if (!parsedData.referenceDocNo && parsedData.col38) {
-        const doMatch = /(?:DO|ใบส่งของ|บิลส่งของ|D[/.]?O[.]?|บิล)\s*[:#№.\s-]*([A-Za-z0-9\-_/]+)/i.exec(parsedData.col38);
+        const doMatch = /(?:DO|ใบส่งของ|บิลส่งของ|D[/.]?O[.]?|บิลเลขที่|บิล|Ref(?:\s*DO)?|อ้างอิง(?:\s*DO)?|ส่งตาม(?:\s*DO)?)\s*[:#№.\s-]*([A-Za-z0-9\-_/]+)/i.exec(parsedData.col38);
         if (doMatch && doMatch[1]) {
           parsedData.referenceDocNo = doMatch[1].trim();
           if (!parsedData.referenceSource) parsedData.referenceSource = 'notes';
         }
-        const poMatch = /(?:PO|ใบสั่งซื้อ|P[/.]?O[.]?)\s*[:#№.\s-]*([A-Za-z0-9\-_/]+)/i.exec(parsedData.col38);
+        const poMatch = /(?:PO|ใบสั่งซื้อ|สั่งซื้อ|P[/.]?O[.]?|Ref(?:\s*PO)?|อ้างอิง(?:\s*PO)?|ตาม(?:\s*PO)?|สัญญา)\s*[:#№.\s-]*([A-Za-z0-9\-_/]+)/i.exec(parsedData.col38);
         if (poMatch && poMatch[1]) {
           if (!parsedData.col4) parsedData.col4 = poMatch[1].trim();
           if (!parsedData.referenceSource) parsedData.referenceSource = 'notes';

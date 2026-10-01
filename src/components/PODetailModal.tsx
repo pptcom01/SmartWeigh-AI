@@ -341,11 +341,21 @@ export const PODetailModal: React.FC<PODetailModalProps> = ({
                 {/* Progress Bar */}
                 <div className="space-y-1.5">
                   <div className="flex items-center justify-between text-xs">
-                    <span className="font-semibold text-slate-700">
-                      ความคืบหน้าการส่งมอบ: {recon.percentageDelivered}%
+                    <span className="font-semibold text-slate-700 flex items-center gap-1.5">
+                      <span>ความคืบหน้าการส่งมอบ:</span>
+                      <span className="font-bold text-blue-700 font-mono text-sm">{recon.percentageDelivered}%</span>
+                      {recon.isMultiItem && (
+                        <span className="px-1.5 py-0.2 rounded text-[10px] bg-indigo-100 text-indigo-800 font-bold border border-indigo-200">
+                          (คำนวณจากมูลค่าเงินรวม - PO หลายรายการ)
+                        </span>
+                      )}
                     </span>
                     <span className="font-mono text-slate-600">
-                      ส่งแล้ว <strong className="text-slate-900">{recon.deliveredQty.toLocaleString('th-TH')} {recon.primaryUnit}</strong> / สั่งซื้อ {po.totalQty.toLocaleString('th-TH')} {recon.primaryUnit}
+                      {recon.isMultiItem ? (
+                        <>มูลค่าตัดยอด <strong className="text-slate-900">{fmtCurrency(recon.deliveredAmount)}</strong> / ทั้งหมด {fmtCurrency(po.totalAmount)}</>
+                      ) : (
+                        <>ส่งแล้ว <strong className="text-slate-900">{recon.deliveredQty.toLocaleString('th-TH')} {recon.primaryUnit}</strong> / สั่งซื้อ {po.totalQty.toLocaleString('th-TH')} {recon.primaryUnit}</>
+                      )}
                     </span>
                   </div>
                   <div className="w-full h-3 rounded-full bg-slate-100 overflow-hidden p-0.5 border border-slate-200">
@@ -358,6 +368,76 @@ export const PODetailModal: React.FC<PODetailModalProps> = ({
                     />
                   </div>
                 </div>
+
+                {/* Multi-Item Breakdown Progress Table */}
+                {recon.isMultiItem && recon.itemReconciliations && recon.itemReconciliations.length > 0 && (
+                  <div className="border border-indigo-200 bg-indigo-50/30 rounded-xl p-4 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-bold text-indigo-950 flex items-center gap-1.5">
+                        <FileText className="w-4 h-4 text-indigo-600" />
+                        <span>ความคืบหน้าตัดยอดแยกตามรายการสินค้า (Itemized Delivery Progress - {po.items.length} รายการ)</span>
+                      </span>
+                      <span className="text-[11px] text-indigo-700 font-medium">
+                        ส่งมอบครบตามชนิดสินค้า ป้องกันนับยอดปะปนกัน
+                      </span>
+                    </div>
+
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-xs text-left border-collapse bg-white rounded-lg overflow-hidden border border-indigo-100">
+                        <thead className="bg-indigo-100/70 text-indigo-950 font-semibold border-b border-indigo-200">
+                          <tr>
+                            <th className="p-2.5">รายการสินค้า (Description)</th>
+                            <th className="p-2.5 text-right">สั่งซื้อ</th>
+                            <th className="p-2.5 text-right">ส่งมอบแล้ว</th>
+                            <th className="p-2.5 text-right">คงเหลือ</th>
+                            <th className="p-2.5 text-center">คืบหน้า</th>
+                            <th className="p-2.5 text-center">สถานะ</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-indigo-50">
+                          {recon.itemReconciliations.map((ir, i) => (
+                            <tr key={ir.item.id || i} className="hover:bg-indigo-50/40">
+                              <td className="p-2.5 font-medium text-slate-900">
+                                <div className="font-semibold">{ir.item.itemDescription}</div>
+                                {ir.item.specCode && <span className="text-[10px] text-slate-500 font-mono">{ir.item.specCode}</span>}
+                              </td>
+                              <td className="p-2.5 text-right font-mono text-slate-800">
+                                {ir.item.orderedQty.toLocaleString('th-TH')} {ir.item.unit}
+                              </td>
+                              <td className="p-2.5 text-right font-mono font-bold text-emerald-700">
+                                {ir.deliveredQty.toLocaleString('th-TH')} {ir.item.unit}
+                              </td>
+                              <td className="p-2.5 text-right font-mono font-bold text-amber-700">
+                                {ir.remainingQty.toLocaleString('th-TH')} {ir.item.unit}
+                              </td>
+                              <td className="p-2.5 text-center">
+                                <div className="flex items-center justify-center gap-1.5 font-mono text-[11px] font-bold">
+                                  <span>{ir.percentageDelivered}%</span>
+                                  <div className="w-12 h-2 rounded-full bg-slate-200 overflow-hidden inline-block">
+                                    <div 
+                                      className={`h-full ${ir.percentageDelivered >= 100 ? 'bg-emerald-500' : 'bg-blue-600'}`}
+                                      style={{ width: `${Math.min(100, ir.percentageDelivered)}%` }}
+                                    />
+                                  </div>
+                                </div>
+                              </td>
+                              <td className="p-2.5 text-center">
+                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                  ir.status === 'completed' ? 'bg-emerald-100 text-emerald-800 border border-emerald-300' :
+                                  ir.status === 'partially_delivered' ? 'bg-blue-100 text-blue-800 border border-blue-300' :
+                                  'bg-slate-100 text-slate-600 border border-slate-200'
+                                }`}>
+                                  {ir.status === 'completed' ? '✓ ครบแล้ว' :
+                                   ir.status === 'partially_delivered' ? '⏳ บางส่วน' : 'รอส่ง'}
+                                </span>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
 
                 {/* Unit Mismatch Alert Banner */}
                 {recon.hasUnitMismatch && (

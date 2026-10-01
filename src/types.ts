@@ -4,7 +4,8 @@
 
 export type DocumentType = 
   | 'delivery_order'    // ใบส่งสินค้า / ใบส่งของทั่วไป (เหล็ก/ท่อ/ปูน/สี/อุปกรณ์/สินค้าไม่ชั่งน้ำหนัก)
-  | 'weighbridge'       // ตั๋วชั่งน้ำหนัก (หิน/ดิน/ทราย/สินค้าชั่งน้ำหนัก)
+  | 'weighbridge'       // ตั๋วชั่งน้ำหนักต้นทาง (หิน/ดิน/ทราย/สินค้าชั่งน้ำหนัก)
+  | 'dest_weighbridge'  // ตั๋วชั่งน้ำหนักปลายทาง (รอชนเข้าโซน 4 ของ DO/ตั๋วต้นทาง)
   | 'concrete'          // ใบส่งคอนกรีตผสมเสร็จ
   | 'tax_invoice'       // ใบเสร็จรับเงิน / ใบกำกับภาษี
   | 'purchase_order'    // ใบสั่งซื้อสินค้า (PO)
@@ -154,6 +155,7 @@ export interface MatchedDeliveryShipment {
   id: string;
   doOrder?: OrderRecord;
   weighbridgeOrder?: OrderRecord;
+  weighbridgeOrders?: OrderRecord[]; // รองรับกรณี 1 DO เชื่อมกับตั๋วชั่งหลายใบ (1-to-N Split Shipments)
   effectiveQty: number;
   effectiveUnit: string;
   effectiveAmount: number;
@@ -161,6 +163,17 @@ export interface MatchedDeliveryShipment {
   referenceSource?: 'form_field' | 'notes' | 'handwritten';
   referenceDocNo?: string;
   linkedViaDocNo?: string;
+}
+
+export interface POItemReconciliation {
+  item: POItem;
+  deliveredQty: number;
+  deliveredAmount: number;
+  remainingQty: number;
+  remainingAmount: number;
+  percentageDelivered: number;
+  status: POStatus;
+  matchedOrdersCount: number;
 }
 
 export interface POReconciliation {
@@ -172,6 +185,10 @@ export interface POReconciliation {
   remainingQty: number;
   remainingAmount: number;
   percentageDelivered: number;
+  financialPercentageDelivered?: number;
+  quantityPercentageDelivered?: number;
+  isMultiItem?: boolean;
+  itemReconciliations?: POItemReconciliation[];
   isOverDelivered: boolean;
   status: POStatus;
   primaryUnit?: string;

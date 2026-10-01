@@ -17,7 +17,8 @@ import {
   Info,
   Link2,
   PenTool,
-  MessageSquare
+  MessageSquare,
+  SlidersHorizontal
 } from 'lucide-react';
 import { OrderRecord, StoreMerchant, DocumentType, PurchaseOrder } from '../types';
 import { ImageDocViewer } from './ImageDocViewer';
@@ -53,6 +54,8 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
   const [selectedDocType, setSelectedDocType] = useState<DocumentType>('delivery_order');
   const [showAllCols, setShowAllCols] = useState(false);
   const [enableDestScale, setEnableDestScale] = useState(false);
+  const [enableWeighbridgePricing, setEnableWeighbridgePricing] = useState(false);
+  const [enableDOWeighing, setEnableDOWeighing] = useState(false);
 
   useEffect(() => {
     if (orderData) {
@@ -85,6 +88,14 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
       const hasDistinctDestWeight = (Number(orderData.col18) > 0 || Number(orderData.col20) > 0) &&
         Number(orderData.col18) !== Number(orderData.col13);
       setEnableDestScale(Boolean(hasDistinctDestWeight));
+
+      // Check if weighbridge already has explicit pricing recorded
+      const hasExplicitPricing = Number(orderData.col24) > 0 || Number(orderData.col27) > 0 || Number(orderData.col29) > 0;
+      setEnableWeighbridgePricing(Boolean(hasExplicitPricing));
+
+      // Check if DO has truck scale weights (Gross/Tare/Net)
+      const hasDOWeighing = Number(orderData.col13) > 0 || Number(orderData.col14) > 0 || Number(orderData.col15) > 0;
+      setEnableDOWeighing(Boolean(hasDOWeighing));
     }
     setShowAllCols(false);
   }, [orderData, isOpen]);
@@ -93,14 +104,15 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
 
   // Document type flags
   const isWeighbridge = selectedDocType === 'weighbridge';
+  const isDestWeighbridge = selectedDocType === 'dest_weighbridge';
   const isDeliveryOrder = selectedDocType === 'delivery_order' || selectedDocType === 'concrete';
   const isTaxInvoice = selectedDocType === 'tax_invoice';
   const isPO = selectedDocType === 'purchase_order';
   const isFullLogistics = selectedDocType === 'full_logistics';
 
   // Determine which zones are relevant for the current document type
-  const showWeightsOrigin = showAllCols || isWeighbridge || isFullLogistics;
-  const showWeightsDest = showAllCols || isFullLogistics || (isWeighbridge && enableDestScale);
+  const showWeightsOrigin = showAllCols || isWeighbridge || isFullLogistics || enableDOWeighing || Number(form.col13) > 0 || Number(form.col15) > 0;
+  const showWeightsDest = showAllCols || isFullLogistics || isDestWeighbridge || (isWeighbridge && enableDestScale);
 
   // Auto-calculation functions
   const handleWeightChange = (field: 'col13' | 'col14' | 'col18' | 'col19', value: number) => {
@@ -219,19 +231,19 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
       col21: showWeightsDest ? (Number(form.col21) || 0) : 0,
       col22: Number(form.col22) || 1,
       col23: form.col23 || (selectedDocType === 'concrete' ? 'คิว' : 'ตัน'),
-      col24: Number(form.col24) || 0,
-      col25: Number(form.col25) || 0,
+      col24: (isWeighbridge && !enableWeighbridgePricing && !showAllCols) ? 0 : (Number(form.col24) || 0),
+      col25: (isWeighbridge && !enableWeighbridgePricing && !showAllCols) ? 0 : (Number(form.col25) || 0),
       col26: form.col26 || '',
-      col27: Number(form.col27) || 0,
-      col28: Number(form.col28) || 0,
-      col29: Number(form.col29) || 0,
-      col30: form.col30 || 'โอนเงิน',
-      col31: Number(form.col31) || 0,
-      col32: Number(form.col32) || 0,
-      col33: Number(form.col33) || 0,
-      col34: Number(form.col34) || 0,
-      col35: Number(form.col35) || 0,
-      col36: Number(form.col36) || 0,
+      col27: (isWeighbridge && !enableWeighbridgePricing && !showAllCols) ? 0 : (Number(form.col27) || 0),
+      col28: (isWeighbridge && !enableWeighbridgePricing && !showAllCols) ? 0 : (Number(form.col28) || 0),
+      col29: (isWeighbridge && !enableWeighbridgePricing && !showAllCols) ? 0 : (Number(form.col29) || 0),
+      col30: form.col30 || (isWeighbridge ? '-' : isDeliveryOrder ? 'รอตรวจรับ / RR' : 'โอนเงิน'),
+      col31: (showAllCols || selectedDocType === 'tax_invoice') ? (Number(form.col31) || 0) : 0,
+      col32: (showAllCols || selectedDocType === 'tax_invoice') ? (Number(form.col32) || 0) : 0,
+      col33: (showAllCols || selectedDocType === 'tax_invoice') ? (Number(form.col33) || 0) : 0,
+      col34: (showAllCols || selectedDocType === 'tax_invoice') ? (Number(form.col34) || 0) : 0,
+      col35: (showAllCols || selectedDocType === 'tax_invoice') ? (Number(form.col35) || 0) : 0,
+      col36: (showAllCols || selectedDocType === 'tax_invoice') ? (Number(form.col36) || 0) : 0,
       col37: form.col37 || '',
       col38: form.col38 || '',
       referenceDocNo: form.referenceDocNo || '',
@@ -563,46 +575,15 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                       </div>
                       <div>
                         <div className="flex items-center justify-between mb-0.5">
-                          <label className="block text-[11px] font-semibold text-slate-700">4. เลขที่ PO อ้างอิง</label>
-                          {/* Reference Source Selector */}
-                          <div className="flex items-center gap-1 text-[10px]">
-                            <button
-                              type="button"
-                              onClick={() => handleTextChange('referenceSource', 'form_field')}
-                              className={`px-1 py-0.2 rounded transition cursor-pointer ${
-                                (form.referenceSource || 'form_field') === 'form_field'
-                                  ? 'bg-blue-600 text-white font-bold'
-                                  : 'text-slate-400 hover:text-slate-700'
-                              }`}
-                              title="พบในช่องฟอร์มเอกสาร"
-                            >
-                              📋 ฟอร์ม
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleTextChange('referenceSource', 'notes')}
-                              className={`px-1 py-0.2 rounded transition cursor-pointer ${
-                                form.referenceSource === 'notes'
-                                  ? 'bg-sky-600 text-white font-bold'
-                                  : 'text-slate-400 hover:text-slate-700'
-                              }`}
-                              title="พบในช่องหมายเหตุ"
-                            >
-                              💬 หมายเหตุ
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleTextChange('referenceSource', 'handwritten')}
-                              className={`px-1 py-0.2 rounded transition cursor-pointer ${
-                                form.referenceSource === 'handwritten'
-                                  ? 'bg-amber-600 text-white font-bold'
-                                  : 'text-slate-400 hover:text-slate-700'
-                              }`}
-                              title="เขียนด้วยลายมือบนบิล"
-                            >
-                              ✍️ ลายมือ
-                            </button>
-                          </div>
+                          <label className="block text-[11px] font-semibold text-slate-700 flex items-center gap-1.5">
+                            <span>4. เลขที่ PO อ้างอิง</span>
+                            {form.referenceSource === 'handwritten' && (
+                              <span className="text-[10px] font-normal text-amber-700 bg-amber-50 px-1.5 py-0.2 rounded border border-amber-200">✍️ ลายมือ</span>
+                            )}
+                            {form.referenceSource === 'notes' && (
+                              <span className="text-[10px] font-normal text-sky-700 bg-sky-50 px-1.5 py-0.2 rounded border border-sky-200">💬 ในหมายเหตุ</span>
+                            )}
+                          </label>
                         </div>
                         <input
                           type="text"
@@ -612,7 +593,7 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                             handleTextChange('referenceDocNo', e.target.value);
                           }}
                           className="w-full p-2 border border-slate-300 rounded-lg bg-white font-mono text-slate-800"
-                          placeholder="PO-xxxxx (ถ้ามี)"
+                          placeholder="PO-xxxxx (AI เติมให้อัตโนมัติ)"
                         />
                         {pos && pos.length > 0 && (
                           <div className="mt-1 flex items-center gap-1 text-[10px] text-slate-500">
@@ -717,13 +698,15 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                         />
                       </div>
                       <div className="col-span-2">
-                        <label className="block text-[11px] font-semibold text-slate-700 mb-0.5">12. สเปก / Code / Slump</label>
+                        <label className="block text-[11px] font-semibold text-slate-700 mb-0.5">
+                          12. สเปก / Code / Slump <span className="text-slate-400 font-normal">(ทางเลือก - เว้นว่างได้หากไม่มีสเปกเฉพาะ)</span>
+                        </label>
                         <input
                           type="text"
                           value={form.col12 || ''}
                           onChange={(e) => handleTextChange('col12', e.target.value)}
-                          className="w-full p-2 border border-slate-300 rounded-lg bg-white font-mono"
-                          placeholder="เช่น SD40, Slump 10±2.5 cm, มอก."
+                          className="w-full p-2 border border-slate-300 rounded-lg bg-white font-mono text-slate-700"
+                          placeholder="เช่น SD40, Slump 10±2.5 cm, มอก. (หรือเว้นว่างได้)"
                         />
                       </div>
                     </div>
@@ -769,6 +752,82 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                               ))}
                             </tbody>
                           </table>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Card 2.5: Optional/Auto-detected Truck Weighing for Delivery Orders that have scale weights */}
+                  <div className="border border-emerald-200 rounded-xl p-3 bg-emerald-50/20 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <div className="font-bold text-emerald-900 text-xs flex items-center gap-1.5">
+                        <Scale className="w-4 h-4 text-emerald-600" />
+                        <span>[โซน 3] น้ำหนักตราชั่งรถบรรทุก (กรณีสินค้าชั่งน้ำหนัก)</span>
+                      </div>
+                      <label className="flex items-center gap-1.5 cursor-pointer text-xs font-semibold text-emerald-900 bg-white px-2.5 py-1 rounded-lg border border-emerald-300 shadow-2xs hover:bg-emerald-50 transition">
+                        <input
+                          type="checkbox"
+                          checked={enableDOWeighing}
+                          onChange={(e) => {
+                            setEnableDOWeighing(e.target.checked);
+                            if (e.target.checked && (!form.col23 || form.col23 === 'รายการ')) {
+                              handleTextChange('col23', 'ตัน');
+                            }
+                          }}
+                          className="rounded text-emerald-600 focus:ring-emerald-500 h-3.5 w-3.5"
+                        />
+                        <span>{enableDOWeighing ? 'เปิดบันทึกชั่งน้ำหนักอยู่' : '⚖️ ใบส่งของนี้มีการชั่งน้ำหนักรถบรรทุก'}</span>
+                      </label>
+                    </div>
+
+                    {enableDOWeighing && (
+                      <div className="space-y-2 pt-1 animate-fadeIn">
+                        <div className="grid grid-cols-3 gap-2">
+                          <div>
+                            <label className="block text-[11px] font-bold text-slate-700 mb-0.5">
+                              13. หนักเข้า (Gross กก.)
+                            </label>
+                            <input
+                              type="number"
+                              value={form.col13 !== undefined ? form.col13 : ''}
+                              onChange={(e) => handleWeightChange('col13', parseFloat(e.target.value) || 0)}
+                              className="w-full p-2 border border-slate-300 rounded-lg bg-white text-right font-mono font-bold text-slate-900 text-sm"
+                              placeholder="0"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-[11px] font-bold text-slate-700 mb-0.5">
+                              14. เบาออก (Tare กก.)
+                            </label>
+                            <input
+                              type="number"
+                              value={form.col14 !== undefined ? form.col14 : ''}
+                              onChange={(e) => handleWeightChange('col14', parseFloat(e.target.value) || 0)}
+                              className="w-full p-2 border border-slate-300 rounded-lg bg-white text-right font-mono font-bold text-slate-900 text-sm"
+                              placeholder="0"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-[11px] font-bold text-emerald-900 mb-0.5">
+                              15. น้ำหนักสุทธิ (Net กก.)
+                            </label>
+                            <input
+                              type="number"
+                              readOnly
+                              value={form.col15 || 0}
+                              className="w-full p-2 border border-emerald-400 rounded-lg bg-emerald-100 text-right font-mono font-bold text-emerald-950 text-sm"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="flex items-center justify-between text-[11px] bg-white p-2 rounded-lg border border-emerald-200 text-emerald-900">
+                          <span className="flex items-center gap-1 font-medium">
+                            <Info className="w-3.5 h-3.5 text-emerald-600" />
+                            <span>ระบบคำนวณปริมาณเป็นตันให้อัตโนมัติ:</span>
+                          </span>
+                          <span className="font-mono font-bold">
+                            {((Number(form.col15) || 0) / 1000).toFixed(2)} ตัน (นำเข้าช่องที่ 22)
+                          </span>
                         </div>
                       </div>
                     )}
@@ -843,63 +902,41 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                     </div>
                   </div>
 
-                  {/* Card 4: Payment & Location */}
+                  {/* Card 4: Delivery Location & Notes (Decoupled from Zone 6 Payment) */}
                   <div className="border border-slate-200 rounded-xl p-3 bg-slate-50 space-y-2">
                     <div className="font-bold text-slate-800 text-xs flex items-center justify-between">
                       <span className="flex items-center gap-1.5">
                         <span className="w-2.5 h-2.5 rounded-full bg-slate-600"></span>
-                        <span>เงื่อนไขการชำระเงิน & สถานที่ส่งมอบ</span>
+                        <span>สถานที่ส่งมอบ & บันทึกการรับของหน้างาน</span>
                       </span>
-                      <span className="text-[11px] font-mono font-bold text-rose-700">
-                        ค้างชำระ: ฿{(form.col36 || 0).toLocaleString()}
+                      <span className="text-[10px] text-slate-500 bg-white px-2 py-0.5 rounded border border-slate-200">
+                        📌 โซน 6 (การชำระเงิน): จะตรวจรับและตั้งหนี้ในระบบ RR & บัญชี
                       </span>
                     </div>
 
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                       <div>
-                        <label className="block text-[10px] font-semibold text-slate-600 mb-0.5">30. รูปแบบการชำระ</label>
-                        <select
-                          value={form.col30 || 'โอนเงิน'}
-                          onChange={(e) => handleTextChange('col30', e.target.value)}
-                          className="w-full p-2 border border-slate-300 rounded-lg bg-white text-xs"
-                        >
-                          <option value="โอนเงิน">โอนเงินธนาคาร</option>
-                          <option value="เครดิต 30 วัน">เครดิต 30 วัน</option>
-                          <option value="เครดิต 15 วัน">เครดิต 15 วัน</option>
-                          <option value="เครดิต 60 วัน">เครดิต 60 วัน</option>
-                          <option value="เงินสด">เงินสด</option>
-                          <option value="เช็ค">เช็คสั่งจ่าย</option>
-                        </select>
-                      </div>
-                      <div>
-                        <label className="block text-[10px] font-semibold text-slate-600 mb-0.5">35. ยอดชำระแล้ว (บาท)</label>
-                        <input
-                          type="number"
-                          step="any"
-                          value={form.col35 !== undefined ? form.col35 : ''}
-                          onChange={(e) => handleFinancialChange('col35', parseFloat(e.target.value) || 0)}
-                          className="w-full p-2 border border-slate-300 rounded-lg bg-white text-right font-mono"
-                          placeholder="0.00"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[10px] font-semibold text-slate-600 mb-0.5">37. สถานที่ส่งมอบ / จุดเท</label>
+                        <label className="block text-[11px] font-semibold text-slate-700 mb-0.5">
+                          37. สถานที่ส่งมอบ / จุดเท <span className="text-slate-400 font-normal">(หน้างาน)</span>
+                        </label>
                         <input
                           type="text"
                           value={form.col37 || ''}
                           onChange={(e) => handleTextChange('col37', e.target.value)}
                           className="w-full p-2 border border-slate-300 rounded-lg bg-white"
-                          placeholder="เช่น อาคาร 2 หรือ จุดเทฐานราก"
+                          placeholder="เช่น อาคาร 2 หรือ จุดเทฐานราก หรือ คลังสินค้าไซต์"
                         />
                       </div>
                       <div>
-                        <label className="block text-[10px] font-semibold text-slate-600 mb-0.5">38. หมายเหตุ</label>
+                        <label className="block text-[11px] font-semibold text-slate-700 mb-0.5">
+                          38. หมายเหตุการส่งของ / ข้อความกำกับบนบิล
+                        </label>
                         <input
                           type="text"
                           value={form.col38 || ''}
                           onChange={(e) => handleTextChange('col38', e.target.value)}
                           className="w-full p-2 border border-slate-300 rounded-lg bg-white"
-                          placeholder="บันทึกเพิ่มเติม"
+                          placeholder="บันทึกหน้างาน หรือข้อความที่พบบนใบส่งของ"
                         />
                       </div>
                     </div>
@@ -949,55 +986,22 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                       {/* Reference to Delivery Order (DO) */}
                       <div className="border border-sky-200 p-2 rounded-lg bg-sky-50/40">
                         <div className="flex items-center justify-between mb-0.5">
-                          <label className="block text-[11px] font-bold text-sky-950">
-                            🔗 เลขที่ใบส่งของ (DO) อ้างอิง
+                          <label className="block text-[11px] font-bold text-sky-950 flex items-center gap-1.5">
+                            <span>🔗 เลขที่ใบส่งของ (DO) อ้างอิง</span>
+                            {form.referenceSource === 'handwritten' && (
+                              <span className="text-[10px] font-normal text-amber-700 bg-amber-50 px-1.5 py-0.2 rounded border border-amber-200">✍️ ลายมือ</span>
+                            )}
+                            {form.referenceSource === 'notes' && (
+                              <span className="text-[10px] font-normal text-sky-700 bg-sky-50 px-1.5 py-0.2 rounded border border-sky-200">💬 ในหมายเหตุ</span>
+                            )}
                           </label>
-                          {/* Reference Source Selector */}
-                          <div className="flex items-center gap-1 text-[10px]">
-                            <button
-                              type="button"
-                              onClick={() => handleTextChange('referenceSource', 'form_field')}
-                              className={`px-1 py-0.2 rounded transition cursor-pointer ${
-                                (form.referenceSource || 'form_field') === 'form_field'
-                                  ? 'bg-blue-600 text-white font-bold'
-                                  : 'text-slate-400 hover:text-slate-700'
-                              }`}
-                              title="พบในช่องฟอร์มเอกสาร"
-                            >
-                              📋 ฟอร์ม
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleTextChange('referenceSource', 'notes')}
-                              className={`px-1 py-0.2 rounded transition cursor-pointer ${
-                                form.referenceSource === 'notes'
-                                  ? 'bg-sky-600 text-white font-bold'
-                                  : 'text-slate-400 hover:text-slate-700'
-                              }`}
-                              title="พบในช่องหมายเหตุ"
-                            >
-                              💬 หมายเหตุ
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleTextChange('referenceSource', 'handwritten')}
-                              className={`px-1 py-0.2 rounded transition cursor-pointer ${
-                                form.referenceSource === 'handwritten'
-                                  ? 'bg-amber-600 text-white font-bold'
-                                  : 'text-slate-400 hover:text-slate-700'
-                              }`}
-                              title="เขียนด้วยลายมือบนตั๋วชั่ง"
-                            >
-                              ✍️ ลายมือ
-                            </button>
-                          </div>
                         </div>
                         <input
                           type="text"
                           value={form.referenceDocNo || ''}
                           onChange={(e) => handleTextChange('referenceDocNo', e.target.value)}
                           className="w-full p-2 border border-sky-300 rounded-lg bg-white font-mono font-semibold text-sky-900"
-                          placeholder="DO-xxxxx หรือ เลขที่บิลส่งของ"
+                          placeholder="DO-xxxxx (AI เติมให้อัตโนมัติ)"
                         />
                         {existingOrders && existingOrders.filter(o => o.docType === 'delivery_order' || o.col6).length > 0 && (
                           <div className="mt-1 flex items-center gap-1 text-[10px] text-slate-500">
@@ -1237,100 +1241,120 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                     )}
                   </div>
 
-                  {/* Card 3: Tons, Freight & Totals */}
-                  <div className="border border-purple-200 rounded-xl p-3 bg-purple-50/20 space-y-2">
-                    <div className="font-bold text-purple-900 text-xs flex items-center justify-between">
+                  {/* Card 3: Delivered Inbound Tonnage (Decoupled from RR Zone 5 Pricing & Zone 6 Payments) */}
+                  <div className="border border-emerald-300 rounded-xl p-3 bg-emerald-50/20 space-y-2.5">
+                    <div className="font-bold text-emerald-950 text-xs flex items-center justify-between">
                       <span className="flex items-center gap-1.5">
-                        <span className="w-2.5 h-2.5 rounded-full bg-purple-500"></span>
-                        <span>ปริมาณคิดเงิน (ตัน), ค่าสินค้า & ค่าบรรทุก</span>
+                        <span className="w-2.5 h-2.5 rounded-full bg-emerald-600"></span>
+                        <span>[ตัดยอดส่งมอบ] ปริมาณรับเข้าหน้างานจริง (ตัน)</span>
                       </span>
-                      <span className="text-[11px] font-mono font-bold text-blue-700">
-                        รวมทั้งสิ้น: ฿{(form.col29 || 0).toLocaleString()}
+                      <span className="text-[10px] text-slate-500 bg-white px-2 py-0.5 rounded border border-slate-200">
+                        📌 โซน 5 (คิดราคา) & โซน 6 (การชำระเงิน): จะคำนวณในระบบ RR
                       </span>
                     </div>
 
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                      <div>
-                        <label className="block text-[11px] font-bold text-slate-800 mb-0.5">
-                          22. ปริมาณ (ตัน) <span className="text-rose-500">*</span>
-                        </label>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <div className="bg-white p-2.5 rounded-lg border border-emerald-200 flex items-center justify-between">
+                        <div>
+                          <label className="block text-[11px] font-bold text-emerald-950">
+                            22. ปริมาณสุทธิส่งมอบ (ตัน) <span className="text-rose-500">*</span>
+                          </label>
+                          <span className="text-[10px] text-emerald-700">แปลงจากน้ำหนักสุทธิ กก. (col15 / 1000)</span>
+                        </div>
                         <input
                           type="number"
                           step="any"
                           required
                           value={form.col22 !== undefined ? form.col22 : ''}
                           onChange={(e) => handleFinancialChange('col22', parseFloat(e.target.value) || 0)}
-                          className="w-full p-2 border border-slate-300 rounded-lg bg-white text-right font-mono font-bold text-slate-900"
+                          className="w-32 p-1.5 border border-emerald-300 rounded-lg bg-emerald-50 text-right font-mono font-bold text-emerald-950 text-base"
                         />
                       </div>
-                      <div>
-                        <label className="block text-[11px] font-semibold text-slate-700 mb-0.5">24. ราคาหิน/ทรายต่อตัน (บาท)</label>
-                        <input
-                          type="number"
-                          step="any"
-                          value={form.col24 !== undefined ? form.col24 : ''}
-                          onChange={(e) => handleFinancialChange('col24', parseFloat(e.target.value) || 0)}
-                          className="w-full p-2 border border-slate-300 rounded-lg bg-white text-right font-mono"
-                          placeholder="0.00"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[11px] font-semibold text-slate-700 mb-0.5">27. ค่าขนส่ง/ตัน (บาท)</label>
-                        <input
-                          type="number"
-                          step="any"
-                          value={form.col27 !== undefined ? form.col27 : ''}
-                          onChange={(e) => handleFinancialChange('col27', parseFloat(e.target.value) || 0)}
-                          className="w-full p-2 border border-slate-300 rounded-lg bg-white text-right font-mono"
-                          placeholder="0.00"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[11px] font-bold text-blue-900 mb-0.5">29. รวมทั้งสิ้น (บาท)</label>
-                        <input
-                          type="number"
-                          readOnly
-                          value={form.col29 || 0}
-                          className="w-full p-2 border border-blue-400 rounded-lg bg-blue-100 text-right font-mono font-bold text-blue-950"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[10px] font-semibold text-slate-600 mb-0.5">26. ประเภทรถ</label>
+
+                      <div className="bg-white p-2.5 rounded-lg border border-slate-200 flex items-center justify-between">
+                        <div>
+                          <label className="block text-[11px] font-semibold text-slate-700">
+                            26. ประเภทรถบรรทุก
+                          </label>
+                          <span className="text-[10px] text-slate-500">สำหรับตรวจสอบขนาดบรรทุก</span>
+                        </div>
                         <input
                           type="text"
                           value={form.col26 || ''}
                           onChange={(e) => handleTextChange('col26', e.target.value)}
-                          className="w-full p-2 border border-slate-300 rounded-lg bg-white"
+                          className="w-36 p-1.5 border border-slate-300 rounded-lg bg-white text-xs font-medium"
                           placeholder="พ่วง 18 ล้อ, สิบล้อ"
                         />
                       </div>
-                      <div>
-                        <label className="block text-[10px] font-semibold text-slate-600 mb-0.5">25. รวมค่าสินค้า</label>
-                        <input
-                          type="number"
-                          readOnly
-                          value={form.col25 || 0}
-                          className="w-full p-2 border border-slate-200 rounded-lg bg-slate-50 text-right font-mono text-slate-700"
-                        />
+                    </div>
+
+                    {/* Optional Pricing Accordion: Only if user explicitly wants to enter price on this ticket */}
+                    <div className="pt-2 border-t border-emerald-200/60">
+                      <div className="flex items-center justify-between">
+                        <button
+                          type="button"
+                          onClick={() => setEnableWeighbridgePricing(!enableWeighbridgePricing)}
+                          className="text-xs text-emerald-800 font-semibold flex items-center gap-1.5 hover:text-emerald-950 transition cursor-pointer"
+                        >
+                          <SlidersHorizontal className="w-3.5 h-3.5 text-emerald-600" />
+                          <span>{enableWeighbridgePricing ? 'ซ่อนการระบุราคา/ค่าขนส่ง' : '⚙️ บันทึกราคาหรือค่าขนส่งเพิ่มเติมในตั๋วนี้ (ทางเลือกเฉพาะกรณีตั๋วระบุราคา)'}</span>
+                        </button>
+                        {enableWeighbridgePricing && (
+                          <span className="text-[11px] font-mono font-bold text-blue-700">
+                            รวมทั้งสิ้น: ฿{(form.col29 || 0).toLocaleString()}
+                          </span>
+                        )}
                       </div>
-                      <div>
-                        <label className="block text-[10px] font-semibold text-slate-600 mb-0.5">28. รวมค่าขนส่ง</label>
-                        <input
-                          type="number"
-                          readOnly
-                          value={form.col28 || 0}
-                          className="w-full p-2 border border-slate-200 rounded-lg bg-slate-50 text-right font-mono text-slate-700"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[10px] font-semibold text-slate-600 mb-0.5">36. ยอดค้างชำระ</label>
-                        <input
-                          type="number"
-                          readOnly
-                          value={form.col36 || 0}
-                          className="w-full p-2 border border-rose-300 rounded-lg bg-rose-50 text-right font-mono font-bold text-rose-800"
-                        />
-                      </div>
+
+                      {enableWeighbridgePricing && (
+                        <div className="mt-2 p-2.5 bg-white rounded-lg border border-purple-200 space-y-2 animate-fadeIn">
+                          <div className="text-[11px] text-purple-900 font-semibold">
+                            การคิดราคาและค่าขนส่งต่อตัน (ระบบ RR):
+                          </div>
+                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                            <div>
+                              <label className="block text-[10px] font-semibold text-slate-700 mb-0.5">24. ราคาหิน/ทรายต่อตัน (บาท)</label>
+                              <input
+                                type="number"
+                                step="any"
+                                value={form.col24 !== undefined ? form.col24 : ''}
+                                onChange={(e) => handleFinancialChange('col24', parseFloat(e.target.value) || 0)}
+                                className="w-full p-1.5 border border-slate-300 rounded-lg bg-white text-right font-mono text-xs"
+                                placeholder="0.00"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[10px] font-semibold text-slate-700 mb-0.5">27. ค่าขนส่ง/ตัน (บาท)</label>
+                              <input
+                                type="number"
+                                step="any"
+                                value={form.col27 !== undefined ? form.col27 : ''}
+                                onChange={(e) => handleFinancialChange('col27', parseFloat(e.target.value) || 0)}
+                                className="w-full p-1.5 border border-slate-300 rounded-lg bg-white text-right font-mono text-xs"
+                                placeholder="0.00"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[10px] font-semibold text-purple-900 mb-0.5">25. รวมค่าสินค้า (บาท)</label>
+                              <input
+                                type="number"
+                                readOnly
+                                value={form.col25 || 0}
+                                className="w-full p-1.5 border border-purple-200 rounded-lg bg-purple-50 text-right font-mono text-xs text-purple-950 font-bold"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[10px] font-bold text-blue-900 mb-0.5">29. รวมทั้งสิ้น (บาท)</label>
+                              <input
+                                type="number"
+                                readOnly
+                                value={form.col29 || 0}
+                                className="w-full p-1.5 border border-blue-300 rounded-lg bg-blue-50 text-right font-mono text-xs text-blue-950 font-bold"
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   </div>
 

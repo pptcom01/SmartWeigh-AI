@@ -473,8 +473,8 @@ export const POManagementView: React.FC<POManagementViewProps> = ({
                             <span className="font-bold font-mono text-slate-800">
                               {recon.percentageDelivered}%
                             </span>
-                            <span className="text-[10px] text-slate-500 font-mono">
-                              {recon.deliveredQty.toLocaleString('th-TH')} / {po.totalQty.toLocaleString('th-TH')}
+                            <span className="text-[10px] text-slate-500 font-mono" title={recon.isMultiItem ? 'ความคืบหน้าคิดตามมูลค่าเงินรวม (Multi-Item PO)' : undefined}>
+                              {recon.isMultiItem ? 'ตามมูลค่าเงิน' : `${recon.deliveredQty.toLocaleString('th-TH')} / ${po.totalQty.toLocaleString('th-TH')}`}
                             </span>
                           </div>
                           <div className="w-full h-2 rounded-full bg-slate-100 overflow-hidden border border-slate-200">
@@ -486,6 +486,13 @@ export const POManagementView: React.FC<POManagementViewProps> = ({
                               style={{ width: `${Math.min(100, recon.percentageDelivered)}%` }}
                             />
                           </div>
+                          {recon.isMultiItem && (
+                            <div className="text-center">
+                              <span className="inline-flex items-center gap-0.5 text-[9px] text-indigo-700 bg-indigo-50 px-1.5 py-0.2 rounded border border-indigo-200 font-medium">
+                                📦 PO หลายรายการ ({po.items.length})
+                              </span>
+                            </div>
+                          )}
                           {recon.hasUnitMismatch && (
                             <div className="text-center">
                               <span className="inline-flex items-center gap-0.5 text-[9px] text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200 font-semibold" title={recon.unitMismatchWarnings?.join('\n')}>

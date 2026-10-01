@@ -25,6 +25,9 @@ export const StatSummaryCards: React.FC<StatSummaryCardsProps> = ({ orders, onFi
   let unpaidCount = 0;
 
   orders.forEach((row) => {
+    // Only accumulate physical inbound shipments; exclude tax_invoice to prevent double-counting financial invoices over DOs, and exclude unmerged dest_weighbridge
+    if (row.docType === 'tax_invoice' || row.docType === 'dest_weighbridge') return;
+
     const netKg = Number(row.col15) || 0;
     totalWeightTons += netKg / 1000;
     if (netKg > 0) weighbridgeCount++;

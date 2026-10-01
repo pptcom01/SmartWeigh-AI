@@ -47,17 +47,25 @@ const DOC_TYPE_OPTIONS: DocTypeOption[] = [
     id: 'delivery_order',
     title: 'ใบส่งของ / ใบส่งสินค้า (DO)',
     icon: '📦',
-    description: 'สินค้าทั่วไปไม่ชั่งน้ำหนัก (เหล็ก, ปูน, ท่อ, สี, ไม้, สายไฟ) และคอนกรีตผสมเสร็จ (คิว/KSC/Slump)',
-    badge: 'สินค้าทั่วไป / คอนกรีต',
+    description: 'สินค้าทั่วไป (เหล็ก, ปูน, ท่อ, สี) คอนกรีตผสมเสร็จ และใบส่งของที่มีการชั่งน้ำหนักรถบรรทุกในตัว',
+    badge: 'สินค้าทั่วไป / ชั่งน้ำหนัก / คอนกรีต',
     color: 'border-sky-500 bg-sky-50/50 text-sky-900'
   },
   {
     id: 'weighbridge',
-    title: 'ตั๋วชั่งน้ำหนักรถบรรทุก',
+    title: 'ตั๋วชั่งน้ำหนักต้นทาง (Origin Scale)',
     icon: '⚖️',
     description: 'สินค้าเทกองชั่งน้ำหนัก (หิน, ดิน, ทราย) เน้นอ่าน Gross หนัก, Tare เบา, Net สุทธิ (กก.) แปลงเป็นตัน',
     badge: 'หิน / ดิน / ทราย',
     color: 'border-emerald-500 bg-emerald-50/50 text-emerald-900'
+  },
+  {
+    id: 'dest_weighbridge',
+    title: 'ตั๋วชั่งปลายทาง (Destination Scale)',
+    icon: '🏁',
+    description: 'ตั๋วชั่งน้ำหนักรถบรรทุกที่หน้างานปลายทาง สกัดน้ำหนักเข้า-ออก เพื่อนำไปชนบิลลง [โซน 4] ของ DO/ตั๋วต้นทาง',
+    badge: 'ชั่งปลายทาง / โซน 4',
+    color: 'border-teal-500 bg-teal-50/50 text-teal-900'
   },
   {
     id: 'tax_invoice',
@@ -77,6 +85,42 @@ const DOC_TYPE_OPTIONS: DocTypeOption[] = [
   }
 ];
 
+// Helper to scale down oversized mobile photos to keep payloads light and crisp
+const optimizeImageForAI = (file: File, maxDim = 1800, quality = 0.85): Promise<string> => {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const rawData = e.target?.result as string;
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > maxDim || height > maxDim) {
+          if (width > height) {
+            height = Math.round((height * maxDim) / width);
+            width = maxDim;
+          } else {
+            width = Math.round((width * maxDim) / height);
+            height = maxDim;
+          }
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, width, height);
+          resolve(canvas.toDataURL('image/jpeg', quality));
+        } else {
+          resolve(rawData);
+        }
+      };
+      img.onerror = () => resolve(rawData);
+      img.src = rawData;
+    };
+    reader.readAsDataURL(file);
+  });
+};
+
 export const ScanModal: React.FC<ScanModalProps> = ({
   isOpen,
   onClose,
@@ -93,7 +137,7 @@ export const ScanModal: React.FC<ScanModalProps> = ({
 
   if (!isOpen) return null;
 
-  const handleFileSelect = (file: File) => {
+  const handleFileSelect = async (file: File) => {
     if (!file.type.startsWith('image/')) {
       setErrorMsg('กรุณาเลือกไฟล์รูปภาพ เช่น JPG, PNG, WEBP');
       return;
@@ -102,12 +146,17 @@ export const ScanModal: React.FC<ScanModalProps> = ({
     setErrorMsg(null);
     setSelectedFile(file);
 
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      const base64 = e.target?.result as string;
-      setPreviewImage(base64);
-    };
-    reader.readAsDataURL(file);
+    try {
+      const optimizedBase64 = await optimizeImageForAI(file);
+      setPreviewImage(optimizedBase64);
+    } catch {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const base64 = e.target?.result as string;
+        setPreviewImage(base64);
+      };
+      reader.readAsDataURL(file);
+    }
   };
 
   const handleDrop = (e: React.DragEvent) => {
