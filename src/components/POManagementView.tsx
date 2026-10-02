@@ -284,24 +284,7 @@ export const POManagementView: React.FC<POManagementViewProps> = ({
               className="px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-300 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
             >
               <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600" />
-              <span>ส่งออก Excel</span>
-            </button>
-
-            <button
-              onClick={onOpenScanPO}
-              className="px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 shadow-xs transition cursor-pointer"
-            >
-              <Sparkles className="w-3.5 h-3.5" />
-              <span>สแกนใบสั่งซื้อด้วย AI</span>
-            </button>
-
-            <button
-              onClick={onOpenCreatePO}
-              className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer"
-              title="ใช้กรณีไม่มีภาพถ่ายเอกสารใบสั่งซื้อ หรือต้องการคีย์ข้อมูลด้วยตนเอง"
-            >
-              <Plus className="w-3.5 h-3.5 text-slate-500" />
-              <span>คีย์ PO ด้วยตนเอง</span>
+              <span>ส่งออกรายงาน PO (Excel)</span>
             </button>
           </div>
 

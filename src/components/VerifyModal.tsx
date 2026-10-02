@@ -20,8 +20,12 @@ import {
   MessageSquare,
   SlidersHorizontal
 } from 'lucide-react';
-import { OrderRecord, StoreMerchant, DocumentType, PurchaseOrder } from '../types';
+import { OrderRecord, StoreMerchant, DocumentType, PurchaseOrder, ProjectRecord } from '../types';
 import { ImageDocViewer } from './ImageDocViewer';
+import { checkDuplicateOrder, isDocNumberMatch } from '../utils/poReconciliation';
+import { buildDatabaseCatalog, CatalogOption, inferMaterialCategory } from '../utils/dbLookup';
+import { SmartDatabaseInput } from './SmartDatabaseInput';
+import { remapLineBillToDocType, convertOrderDraftToPODraft, rescanBillForTargetDocType } from '../utils/lineBillRemapper';
 
 interface VerifyModalProps {
   isOpen: boolean;
@@ -29,6 +33,7 @@ interface VerifyModalProps {
   billImage: string | null;
   storeSuggestion?: Partial<StoreMerchant>;
   stores: StoreMerchant[];
+  projects?: ProjectRecord[];
   pos?: PurchaseOrder[];
   existingOrders?: OrderRecord[];
   onClose: () => void;
@@ -42,6 +47,7 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
   billImage,
   storeSuggestion,
   stores,
+  projects = [],
   pos = [],
   existingOrders = [],
   onClose,
@@ -53,28 +59,85 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
   const [saveToStoreDirectory, setSaveToStoreDirectory] = useState(true);
   const [selectedDocType, setSelectedDocType] = useState<DocumentType>('delivery_order');
   const [showAllCols, setShowAllCols] = useState(false);
+  const [showDocTypeSwitcher, setShowDocTypeSwitcher] = useState(false);
+  const [confirmDuplicateOverride, setConfirmDuplicateOverride] = useState(false);
   const [enableDestScale, setEnableDestScale] = useState(false);
   const [enableWeighbridgePricing, setEnableWeighbridgePricing] = useState(false);
   const [enableDOWeighing, setEnableDOWeighing] = useState(false);
+  const [projectMissingError, setProjectMissingError] = useState(false);
+  const [remappedNotice, setRemappedNotice] = useState<string | null>(null);
+  const [isRescanningAI, setIsRescanningAI] = useState(false);
 
   useEffect(() => {
     if (orderData) {
-      setForm({ ...orderData });
-      setCurrentImage(billImage || orderData.image || null);
+      const normalized = { ...orderData };
+      // Physical invariant: Gross (col13) must be >= Tare (col14)
+      const c13 = Number(normalized.col13) || 0;
+      const c14 = Number(normalized.col14) || 0;
+      if (c13 > 0 && c14 > 0 && c13 < c14) {
+        normalized.col13 = c14;
+        normalized.col14 = c13;
+        normalized.col15 = c14 - c13;
+      } else if (c13 > 0 && c14 > 0 && !normalized.col15) {
+        normalized.col15 = c13 - c14;
+      }
 
-      // Intelligent detection of document type if not specified
-      let detectedType: DocumentType = orderData.docType || 'delivery_order';
-      if (!orderData.docType) {
-        const netO = Number(orderData.col13) || Number(orderData.col15) || 0;
-        const cat = (orderData.col3 || '').toLowerCase();
-        const item = (orderData.col11 || '').toLowerCase();
-        const unit = (orderData.col23 || '').toLowerCase();
-        const doNum = (orderData.col6 || '').toLowerCase();
+      // Physical invariant: Dest Gross (col18) must be >= Dest Tare (col19)
+      const c18 = Number(normalized.col18) || 0;
+      const c19 = Number(normalized.col19) || 0;
+      if (c18 > 0 && c19 > 0 && c18 < c19) {
+        normalized.col18 = c19;
+        normalized.col19 = c18;
+        normalized.col20 = c19 - c18;
+      } else if (c18 > 0 && c19 > 0 && !normalized.col20) {
+        normalized.col20 = c18 - c19;
+      }
 
-        if (cat.includes('คอนกรีต') || item.includes('คอนกรีต') || unit.includes('คิว') || unit.includes('m3')) {
-          detectedType = 'concrete';
-        } else if (netO > 0 || cat.includes('หิน') || cat.includes('ดิน') || cat.includes('ทราย') || item.includes('หิน')) {
-          detectedType = 'weighbridge';
+      if (!normalized.rawAiSnapshot || Object.keys(normalized.rawAiSnapshot).length === 0) {
+        normalized.rawAiSnapshot = {
+          rawDocNo: normalized.col17 || normalized.col6 || '',
+          rawRefPoNo: normalized.col4 || '',
+          rawRefDoNo: normalized.referenceDocNo || '',
+          rawDate: normalized.col7 || normalized.col16 || '',
+          rawGrossWeightKg: Number(normalized.col13) || Number(normalized.col18) || 0,
+          rawTareWeightKg: Number(normalized.col14) || Number(normalized.col19) || 0,
+          rawNetWeightKg: Number(normalized.col15) || Number(normalized.col20) || 0
+        } as any;
+      }
+
+      // Auto-infer Column 3 (หมวดหมู่วัสดุ) if empty or generic
+      const matchedPOForCat = normalized.col4
+        ? pos.find(p => isDocNumberMatch(p.poNumber, normalized.col4))
+        : undefined;
+      const matchedStoreForCat = normalized.col8
+        ? stores.find(s => s.name.trim().toLowerCase() === normalized.col8!.trim().toLowerCase())
+        : undefined;
+      normalized.col3 = inferMaterialCategory(
+        normalized.col11,
+        matchedStoreForCat?.category || storeSuggestion?.category,
+        matchedPOForCat?.category,
+        normalized.col3,
+        normalized.col12
+      );
+
+      setForm(normalized);
+      setCurrentImage(billImage || normalized.image || null);
+      setConfirmDuplicateOverride(false);
+      setProjectMissingError(false);
+      setRemappedNotice(null);
+
+      // Intelligent detection of document type if not specified (Origin store weighbridge & concrete are unified under delivery_order / DO)
+      let detectedType: DocumentType = (normalized.docType === 'weighbridge' || normalized.docType === 'concrete')
+        ? 'delivery_order'
+        : (normalized.docType || 'delivery_order');
+      if (!normalized.docType) {
+        const netO = Number(normalized.col13) || Number(normalized.col15) || 0;
+        const netD = Number(normalized.col18) || Number(normalized.col20) || 0;
+        const item = (normalized.col11 || '').toLowerCase();
+        const doNum = (normalized.col6 || '').toLowerCase();
+
+        if (netD > 0 && netO === 0) {
+          detectedType = 'dest_weighbridge';
         } else if (doNum.includes('inv') || doNum.includes('tax') || item.includes('ภาษี')) {
           detectedType = 'tax_invoice';
         } else {
@@ -85,34 +148,74 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
       setSelectedDocType(detectedType);
 
       // Only enable destination scale if col18 or col20 has a genuine non-zero value different from origin
-      const hasDistinctDestWeight = (Number(orderData.col18) > 0 || Number(orderData.col20) > 0) &&
-        Number(orderData.col18) !== Number(orderData.col13);
+      const hasDistinctDestWeight = (Number(normalized.col18) > 0 || Number(normalized.col20) > 0) &&
+        Number(normalized.col18) !== Number(normalized.col13);
       setEnableDestScale(Boolean(hasDistinctDestWeight));
 
       // Check if weighbridge already has explicit pricing recorded
-      const hasExplicitPricing = Number(orderData.col24) > 0 || Number(orderData.col27) > 0 || Number(orderData.col29) > 0;
+      const hasExplicitPricing = Number(normalized.col24) > 0 || Number(normalized.col27) > 0 || Number(normalized.col29) > 0;
       setEnableWeighbridgePricing(Boolean(hasExplicitPricing));
 
       // Check if DO has truck scale weights (Gross/Tare/Net)
-      const hasDOWeighing = Number(orderData.col13) > 0 || Number(orderData.col14) > 0 || Number(orderData.col15) > 0;
+      const hasDOWeighing = Number(normalized.col13) > 0 || Number(normalized.col14) > 0 || Number(normalized.col15) > 0;
       setEnableDOWeighing(Boolean(hasDOWeighing));
     }
     setShowAllCols(false);
   }, [orderData, isOpen]);
 
+  // Real-time duplicate bill detection against existingOrders (Must be called before any conditional return)
+  const duplicateMatches = React.useMemo(() => {
+    if (!isOpen || !orderData) return [];
+    return checkDuplicateOrder({ ...form, docType: selectedDocType }, existingOrders, currentImage);
+  }, [isOpen, orderData, form, selectedDocType, existingOrders, currentImage]);
+
+  const dbCatalog = React.useMemo(
+    () => buildDatabaseCatalog(stores, projects, pos, existingOrders),
+    [stores, projects, pos, existingOrders]
+  );
+
+  // Prioritize items from the currently linked PO (if col4 matches a PO) at the top of the item options list
+  const poAwareItemOptions = React.useMemo<CatalogOption[]>(() => {
+    const matchedPO = form.col4 ? pos.find(p => isDocNumberMatch(p.poNumber, form.col4)) : undefined;
+    if (!matchedPO || !matchedPO.items || matchedPO.items.length === 0) {
+      return dbCatalog.items;
+    }
+    const poOpts: CatalogOption[] = matchedPO.items.map(it => ({
+      value: it.itemDescription,
+      subLabel: [
+        it.specCode ? `สเปก: ${it.specCode}` : '',
+        `สั่ง ${it.orderedQty} ${it.unit}`,
+        it.unitPrice ? `฿${it.unitPrice.toLocaleString()}/${it.unit}` : ''
+      ].filter(Boolean).join(' • '),
+      badge: `🎯 ใน PO ${matchedPO.poNumber}`,
+      meta: {
+        specCode: it.specCode,
+        unit: it.unit,
+        unitPrice: it.unitPrice,
+        storeName: matchedPO.storeName
+      }
+    }));
+    const poKeys = new Set(poOpts.map(o => o.value.trim().toLowerCase()));
+    const rest = dbCatalog.items.filter(o => !poKeys.has(o.value.trim().toLowerCase()));
+    return [...poOpts, ...rest];
+  }, [form.col4, pos, dbCatalog.items]);
+
+  const blockingDuplicates = duplicateMatches.filter(m => m.level === 'exact' || m.level === 'suspected');
+  const primaryDuplicate = duplicateMatches[0];
+
   if (!isOpen || !orderData) return null;
 
-  // Document type flags
-  const isWeighbridge = selectedDocType === 'weighbridge';
+  // Document type flags (Origin store weighbridge & concrete are unified as Delivery Order / DO)
+  const isWeighbridge = false;
   const isDestWeighbridge = selectedDocType === 'dest_weighbridge';
-  const isDeliveryOrder = selectedDocType === 'delivery_order' || selectedDocType === 'concrete';
+  const isDeliveryOrder = selectedDocType === 'delivery_order' || selectedDocType === 'concrete' || selectedDocType === 'weighbridge';
   const isTaxInvoice = selectedDocType === 'tax_invoice';
   const isPO = selectedDocType === 'purchase_order';
   const isFullLogistics = selectedDocType === 'full_logistics';
 
   // Determine which zones are relevant for the current document type
   const showWeightsOrigin = showAllCols || isWeighbridge || isFullLogistics || enableDOWeighing || Number(form.col13) > 0 || Number(form.col15) > 0;
-  const showWeightsDest = showAllCols || isFullLogistics || isDestWeighbridge || (isWeighbridge && enableDestScale);
+  const showWeightsDest = showAllCols || isFullLogistics || isDestWeighbridge || (isWeighbridge && enableDestScale) || Boolean(form.col17) || Number(form.col18) > 0 || Number(form.col20) > 0;
 
   // Auto-calculation functions
   const handleWeightChange = (field: 'col13' | 'col14' | 'col18' | 'col19', value: number) => {
@@ -137,12 +240,48 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
 
     // Auto-update quantity if unit is tons
     const unit = nextForm.col23 || 'ตัน';
-    if (unit.includes('ตัน') && netO > 0 && (!nextForm.col22 || nextForm.col22 === 0)) {
-      nextForm.col22 = Number((netO / 1000).toFixed(2));
+    const effectiveNet = netO > 0 ? netO : netD;
+    if (unit.includes('ตัน') && effectiveNet > 0 && (!nextForm.col22 || nextForm.col22 === 0 || isDestWeighbridge || isWeighbridge)) {
+      nextForm.col22 = Number((effectiveNet / 1000).toFixed(2));
     }
 
     setForm(nextForm);
     recalculateFinancials(nextForm);
+  };
+
+  // 1-Click Swap for Zone 3 (col13 <-> col14)
+  const handleSwapOriginWeights = () => {
+    const newCol13 = Number(form.col14) || 0;
+    const newCol14 = Number(form.col13) || 0;
+    const newCol15 = Math.max(0, newCol13 - newCol14);
+    const nextForm: Partial<OrderRecord> = {
+      ...form,
+      col13: newCol13,
+      col14: newCol14,
+      col15: newCol15
+    };
+    if ((nextForm.col23 || '').includes('ตัน') && newCol15 > 0) {
+      nextForm.col22 = Number((newCol15 / 1000).toFixed(2));
+    }
+    setForm(nextForm);
+    recalculateFinancials(nextForm);
+  };
+
+  // 1-Click Swap for Zone 4 (col18 <-> col19)
+  const handleSwapDestWeights = () => {
+    const newCol18 = Number(form.col19) || 0;
+    const newCol19 = Number(form.col18) || 0;
+    const newCol20 = Math.max(0, newCol18 - newCol19);
+    const nextForm: Partial<OrderRecord> = {
+      ...form,
+      col18: newCol18,
+      col19: newCol19,
+      col20: newCol20
+    };
+    if (Number(nextForm.col15) > 0 && newCol20 > 0) {
+      nextForm.col21 = Number(nextForm.col15) - newCol20;
+    }
+    setForm(nextForm);
   };
 
   const handleFinancialChange = (field: 'col22' | 'col24' | 'col27' | 'col31' | 'col33' | 'col35', value: number) => {
@@ -178,12 +317,19 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
   };
 
   const handleTextChange = (field: keyof OrderRecord, value: string) => {
+    if (field === 'col2' && value.trim()) {
+      setProjectMissingError(false);
+    }
     setForm(prev => ({ ...prev, [field]: value }));
   };
 
   const handleDocTypeSelect = (docType: DocumentType) => {
     setSelectedDocType(docType);
-    const updated = { ...form, docType };
+    const updated = remapLineBillToDocType(form, docType);
+
+    if (docType === 'delivery_order' && Number(updated.col15) > 0) {
+      setEnableDOWeighing(true);
+    }
 
     // Auto-adjust default unit or vehicle based on doc type
     if (docType === 'concrete') {
@@ -191,7 +337,9 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
       if (!updated.col26) updated.col26 = 'รถโม่คอนกรีต';
       if (!updated.col3) updated.col3 = 'งานคอนกรีตผสมเสร็จ';
     } else if (docType === 'delivery_order') {
-      if (!updated.col23 || updated.col23 === 'ตัน') updated.col23 = 'รายการ';
+      if (!updated.col23 || updated.col23 === 'ตัน') {
+        updated.col23 = Number(updated.col15) > 0 ? 'ตัน' : 'รายการ';
+      }
       if (!updated.col26) updated.col26 = 'สิบล้อ/หกล้อ';
     } else if (docType === 'weighbridge') {
       if (!updated.col23) updated.col23 = 'ตัน';
@@ -200,16 +348,49 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
     }
 
     setForm(updated);
+    setRemappedNotice(
+      docType === 'dest_weighbridge'
+        ? '⚡ ย้ายเลขที่ตั๋วไปช่อง 17 และน้ำหนักไปช่อง 18–20 ให้อัตโนมัติแล้ว (ไม่ต้องให้ AI อ่านใหม่)'
+        : docType === 'delivery_order'
+        ? '⚡ ย้ายเลขที่บิลไปช่อง 6 (DO) และน้ำหนักไปช่อง 13–15 ให้อัตโนมัติแล้ว (ไม่ต้องให้ AI อ่านใหม่)'
+        : docType === 'tax_invoice'
+        ? '⚡ สลับเป็นโหมดใบเสร็จ/ใบกำกับภาษีอัตโนมัติแล้ว (ไม่ต้องให้ AI อ่านใหม่)'
+        : '⚡ เตรียมข้อมูลสำหรับโอนเข้าใบสั่งซื้อ (PO) เรียบร้อยแล้ว'
+    );
   };
 
-  const handleFormSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleOptionalAIRescan = async () => {
+    const imgToScan = currentImage || billImage || form.image;
+    if (!imgToScan || isRescanningAI) return;
+    setIsRescanningAI(true);
+    setRemappedNotice('🤖 กำลังให้ AI อ่านข้อมูลใหม่เฉพาะตามประเภทเอกสารที่เลือก...');
+    try {
+      const res = await rescanBillForTargetDocType(imgToScan, selectedDocType, form);
+      if (res.success && res.orderData) {
+        if (selectedDocType === 'purchase_order' && res.poData && onSwitchToPO) {
+          onSwitchToPO(res.poData);
+          onClose();
+          return;
+        }
+        setForm(res.orderData);
+        if (Number(res.orderData.col15) > 0) setEnableDOWeighing(true);
+        setRemappedNotice('✅ AI อ่านข้อมูลใหม่ตามประเภทเอกสารที่เลือกเรียบร้อยแล้ว!');
+      } else {
+        setRemappedNotice(`⚠️ ${res.error || 'ไม่สามารถสแกนใหม่ได้ แต่ข้อมูลเดิมยังอยู่ครบ'}`);
+      }
+    } catch {
+      setRemappedNotice('⚠️ เกิดข้อผิดพลาดในการสแกนซ้ำ แต่ข้อมูลเดิมยังอยู่ครบ');
+    } finally {
+      setIsRescanningAI(false);
+    }
+  };
 
+  const buildFinalizedOrder = (overrideExistingOrder?: OrderRecord): { finalizedOrder: OrderRecord; storeToSave?: StoreMerchant } => {
     const finalizedOrder: OrderRecord = {
-      id: form.id || 'ord-' + Date.now(),
+      id: overrideExistingOrder ? overrideExistingOrder.id : (form.id || 'ord-' + Date.now()),
       docType: selectedDocType,
-      col1: form.col1 || 'TR-' + new Date().getFullYear() + '-' + Math.floor(100 + Math.random() * 900),
-      col2: form.col2 || 'โครงการทั่วไป',
+      col1: overrideExistingOrder ? overrideExistingOrder.col1 : (form.col1 || 'TR-' + new Date().getFullYear() + '-' + Math.floor(100 + Math.random() * 900)),
+      col2: (form.col2 || '').trim(),
       col3: form.col3 || (selectedDocType === 'concrete' ? 'คอนกรีต' : 'ทั่วไป'),
       col4: form.col4 || '',
       col5: form.col5 || '',
@@ -237,7 +418,7 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
       col27: (isWeighbridge && !enableWeighbridgePricing && !showAllCols) ? 0 : (Number(form.col27) || 0),
       col28: (isWeighbridge && !enableWeighbridgePricing && !showAllCols) ? 0 : (Number(form.col28) || 0),
       col29: (isWeighbridge && !enableWeighbridgePricing && !showAllCols) ? 0 : (Number(form.col29) || 0),
-      col30: form.col30 || (isWeighbridge ? '-' : isDeliveryOrder ? 'รอตรวจรับ / RR' : 'โอนเงิน'),
+      col30: form.col30 || (isWeighbridge ? '-' : isDeliveryOrder ? 'เครดิต / รอวางบิล (RR)' : 'โอนเงิน'),
       col31: (showAllCols || selectedDocType === 'tax_invoice') ? (Number(form.col31) || 0) : 0,
       col32: (showAllCols || selectedDocType === 'tax_invoice') ? (Number(form.col32) || 0) : 0,
       col33: (showAllCols || selectedDocType === 'tax_invoice') ? (Number(form.col33) || 0) : 0,
@@ -248,15 +429,28 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
       col38: form.col38 || '',
       referenceDocNo: form.referenceDocNo || '',
       referenceSource: form.referenceSource || 'form_field',
-      linkedViaDocNo: form.linkedViaDocNo || '',
+      linkedViaDocNo: form.linkedViaDocNo || overrideExistingOrder?.linkedViaDocNo || '',
+      poMatchStatus: form.poMatchStatus,
+      destMatchStatus: form.destMatchStatus,
+      matchedDestTicketId: form.matchedDestTicketId,
+      autoActionFlags: form.autoActionFlags,
+      autoFlagsVerified: Boolean(form.id) ? true : form.autoFlagsVerified,
       lineItems: form.lineItems,
-      image: currentImage || billImage || form.image || null,
+      image: currentImage || billImage || form.image || overrideExistingOrder?.image || null,
       aiExtracted: true,
       status: 'verified',
-      createdAt: form.createdAt || new Date().toISOString()
+      createdAt: overrideExistingOrder?.createdAt || form.createdAt || new Date().toISOString(),
+      lineInboxId: form.lineInboxId || overrideExistingOrder?.lineInboxId,
+      lineMessageId: form.lineMessageId || overrideExistingOrder?.lineMessageId,
+      lineUserId: form.lineUserId || overrideExistingOrder?.lineUserId,
+      lineSenderName: form.lineSenderName || overrideExistingOrder?.lineSenderName,
+      lineSenderAvatar: form.lineSenderAvatar || overrideExistingOrder?.lineSenderAvatar,
+      lineGroupId: form.lineGroupId || overrideExistingOrder?.lineGroupId,
+      lineGroupName: form.lineGroupName || overrideExistingOrder?.lineGroupName,
+      lineReceivedAt: form.lineReceivedAt || overrideExistingOrder?.lineReceivedAt,
+      rawAiSnapshot: form.rawAiSnapshot || overrideExistingOrder?.rawAiSnapshot
     };
 
-    // Prepare Store/Merchant object if requested
     let storeToSave: StoreMerchant | undefined;
     if (saveToStoreDirectory && finalizedOrder.col8) {
       const existingStore = stores.find(
@@ -287,6 +481,39 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
       }
     }
 
+    return { finalizedOrder, storeToSave };
+  };
+
+  const handleOverwriteExistingDuplicate = (existingOrder: OrderRecord) => {
+    const { finalizedOrder, storeToSave } = buildFinalizedOrder(existingOrder);
+    onSaveOrder(finalizedOrder, storeToSave);
+    onClose();
+  };
+
+  const handleInspectExistingDuplicate = (existingOrder: OrderRecord) => {
+    setForm({ ...existingOrder });
+    setCurrentImage(existingOrder.image || null);
+    if (existingOrder.docType) {
+      setSelectedDocType(existingOrder.docType);
+    }
+    setConfirmDuplicateOverride(false);
+  };
+
+  const handleFormSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+
+    // Strict Hard Block: Never allow saving a duplicate bill as a new record
+    if (blockingDuplicates.length > 0) {
+      return;
+    }
+
+    // Strict Mandatory Check: "ชื่อโครงการ (ช่อง 2)" must be present before confirming save
+    if (!form.col2 || !form.col2.trim()) {
+      setProjectMissingError(true);
+      return;
+    }
+
+    const { finalizedOrder, storeToSave } = buildFinalizedOrder();
     onSaveOrder(finalizedOrder, storeToSave);
     onClose();
   };
@@ -336,13 +563,50 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
           {/* Right Column: Dynamic Form tailored by Bill Type (7 Cols) */}
           <div className="md:col-span-7 bg-white p-4 overflow-y-auto space-y-3.5 flex flex-col h-full text-xs">
             
-            {/* Top Toolbar: Document Type Selector Buttons */}
+            {/* Top Toolbar: Active Document Mode & Optional Switcher */}
             <div className="bg-slate-100 p-2 rounded-xl border border-slate-200 space-y-2">
-              <div className="flex items-center justify-between">
-                <span className="font-bold text-slate-800 text-xs flex items-center gap-1.5">
-                  <Layers className="w-4 h-4 text-blue-600" />
-                  <span>ประเภทเอกสาร / บิล:</span>
-                </span>
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-bold text-slate-800 text-xs flex items-center gap-1.5">
+                    <Layers className="w-4 h-4 text-blue-600" />
+                    <span>ประเภทเอกสาร:</span>
+                  </span>
+                  <span className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border ${
+                    isDestWeighbridge
+                      ? 'bg-teal-50 text-teal-900 border-teal-300'
+                      : isTaxInvoice
+                      ? 'bg-amber-50 text-amber-900 border-amber-300'
+                      : isPO
+                      ? 'bg-indigo-50 text-indigo-900 border-indigo-300'
+                      : 'bg-sky-50 text-sky-900 border-sky-300'
+                  }`}>
+                    {isDestWeighbridge
+                      ? '⚖️ ตั๋วชั่งน้ำหนักปลายทาง (ช่อง 18–20)'
+                      : isTaxInvoice
+                      ? '🧾 ใบเสร็จรับเงิน / ใบกำกับภาษี'
+                      : isPO
+                      ? '📝 ใบสั่งซื้อสินค้า (PO)'
+                      : '📦 ใบส่งของ / ใบส่งสินค้า (DO • ช่อง 13–15)'}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setShowDocTypeSwitcher(!showDocTypeSwitcher)}
+                    className="px-2.5 py-1 rounded-lg text-[11px] font-bold bg-white text-blue-700 border border-blue-300 hover:bg-blue-50 transition cursor-pointer shadow-2xs"
+                  >
+                    {showDocTypeSwitcher ? 'ซ่อนตัวเลือกประเภทบิล ▴' : 'สลับประเภทเอกสาร ▾'}
+                  </button>
+                  {(currentImage || billImage || form.image) && (
+                    <button
+                      type="button"
+                      disabled={isRescanningAI}
+                      onClick={handleOptionalAIRescan}
+                      title="ปกติเมื่อสลับประเภทบิล ระบบจะย้ายช่องข้อมูลให้อัตโนมัติทันที แต่หากต้องการให้ AI อ่านซ้ำเฉพาะตามประเภทนี้สามารถกดปุ่มนี้ได้"
+                      className="px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-indigo-50 text-indigo-800 border border-indigo-200 hover:bg-indigo-100 transition cursor-pointer disabled:opacity-50"
+                    >
+                      {isRescanningAI ? '🤖 กำลังอ่านใหม่...' : '🤖 ให้ AI อ่านใหม่ตามประเภทนี้ (ทางเลือก)'}
+                    </button>
+                  )}
+                </div>
                 
                 {/* Toggle Show All 39 Cols button */}
                 <button
@@ -359,82 +623,293 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                 </button>
               </div>
 
-              {/* Document Type Selector Segmented Options */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
-                
-                {/* 1. Purchase Order */}
-                <button
-                  type="button"
-                  onClick={() => handleDocTypeSelect('purchase_order')}
-                  className={`p-2 rounded-lg text-left border transition cursor-pointer ${
-                    selectedDocType === 'purchase_order'
-                      ? 'bg-indigo-50 border-indigo-400 text-indigo-900 shadow-xs ring-1 ring-indigo-400'
-                      : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
-                  }`}
-                >
-                  <div className="flex items-center gap-1.5 font-bold text-xs">
-                    <FileText className="w-3.5 h-3.5 text-indigo-600" />
-                    <span>ใบสั่งซื้อ (PO)</span>
+              {/* Document Type Selector Grouped by Store vs Company (Shown only when user wants to switch doc type) */}
+              {showDocTypeSwitcher && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 animate-fadeIn">
+                {/* กลุ่ม 1: บิลจากร้านค้า / ผู้จำหน่าย */}
+                <div className="p-1.5 rounded-lg border border-sky-200 bg-sky-50/40 space-y-1">
+                  <div className="text-[10px] font-bold text-sky-900 px-1 flex items-center justify-between">
+                    <span>🏪 บิลจากร้านค้า / ผู้จำหน่าย</span>
+                    <span className="text-[9px] text-sky-700">ช่อง 13-15 & โซน 5-6</span>
                   </div>
-                  <div className="text-[10px] text-slate-500 mt-0.5 truncate">เอกสารสั่งซื้อ / เงื่อนไขจัดซื้อ</div>
-                </button>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {/* 1. Delivery Order */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        handleDocTypeSelect('delivery_order');
+                        setShowDocTypeSwitcher(false);
+                      }}
+                      className={`p-2 rounded-lg text-left border transition cursor-pointer ${
+                        selectedDocType === 'delivery_order' || selectedDocType === 'concrete'
+                          ? 'bg-sky-50 border-sky-500 text-sky-950 shadow-xs ring-1 ring-sky-500'
+                          : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                      }`}
+                    >
+                      <div className="flex items-center gap-1.5 font-bold text-xs">
+                        <Boxes className="w-3.5 h-3.5 text-sky-600 shrink-0" />
+                        <span className="truncate">ใบส่งของ (DO)</span>
+                      </div>
+                      <div className="text-[10px] text-slate-500 mt-0.5 truncate">บิลร้านค้า (ชั่งต้นทาง 13-15)</div>
+                    </button>
 
-                {/* 2. Delivery Order (Includes Concrete & General Goods) */}
-                <button
-                  type="button"
-                  onClick={() => handleDocTypeSelect('delivery_order')}
-                  className={`p-2 rounded-lg text-left border transition cursor-pointer ${
-                    selectedDocType === 'delivery_order'
-                      ? 'bg-sky-50 border-sky-400 text-sky-900 shadow-xs ring-1 ring-sky-400'
-                      : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
-                  }`}
-                >
-                  <div className="flex items-center gap-1.5 font-bold text-xs">
-                    <Boxes className="w-3.5 h-3.5 text-sky-600" />
-                    <span>ใบส่งของ (DO)</span>
+                    {/* 2. Tax Invoice */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        handleDocTypeSelect('tax_invoice');
+                        setShowDocTypeSwitcher(false);
+                      }}
+                      className={`p-2 rounded-lg text-left border transition cursor-pointer ${
+                        selectedDocType === 'tax_invoice'
+                          ? 'bg-amber-50 border-amber-500 text-amber-950 shadow-xs ring-1 ring-amber-500'
+                          : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                      }`}
+                    >
+                      <div className="flex items-center gap-1.5 font-bold text-xs">
+                        <Receipt className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                        <span className="truncate">ใบเสร็จ/กำกับภาษี</span>
+                      </div>
+                      <div className="text-[10px] text-slate-500 mt-0.5 truncate">บิลการเงิน/ภาษีจากร้านค้า</div>
+                    </button>
                   </div>
-                  <div className="text-[10px] text-slate-500 mt-0.5 truncate">สินค้าทั่วไป & คอนกรีตผสมเสร็จ</div>
-                </button>
+                </div>
 
-                {/* 3. Weighbridge */}
-                <button
-                  type="button"
-                  onClick={() => handleDocTypeSelect('weighbridge')}
-                  className={`p-2 rounded-lg text-left border transition cursor-pointer ${
-                    selectedDocType === 'weighbridge'
-                      ? 'bg-emerald-50 border-emerald-400 text-emerald-900 shadow-xs ring-1 ring-emerald-400'
-                      : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
-                  }`}
-                >
-                  <div className="flex items-center gap-1.5 font-bold text-xs">
-                    <Scale className="w-3.5 h-3.5 text-emerald-600" />
-                    <span>ตั๋วชั่งน้ำหนัก</span>
+                {/* กลุ่ม 2: เอกสารของบริษัทเรา / หน้างาน */}
+                <div className="p-1.5 rounded-lg border border-indigo-200 bg-indigo-50/40 space-y-1">
+                  <div className="text-[10px] font-bold text-indigo-950 px-1 flex items-center justify-between">
+                    <span>🏢 เอกสารของบริษัทเรา / ตรวจรับหน้างาน</span>
+                    <span className="text-[9px] text-indigo-700">PO & ช่อง 18-20</span>
                   </div>
-                  <div className="text-[10px] text-slate-500 mt-0.5 truncate">หิน/ดิน/ทราย (ชั่ง Gross/Tare)</div>
-                </button>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {/* 3. Purchase Order */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        handleDocTypeSelect('purchase_order');
+                        setShowDocTypeSwitcher(false);
+                      }}
+                      className={`p-2 rounded-lg text-left border transition cursor-pointer ${
+                        selectedDocType === 'purchase_order'
+                          ? 'bg-indigo-50 border-indigo-500 text-indigo-950 shadow-xs ring-1 ring-indigo-500'
+                          : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                      }`}
+                    >
+                      <div className="flex items-center gap-1.5 font-bold text-xs">
+                        <FileText className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+                        <span className="truncate">ใบสั่งซื้อ (PO)</span>
+                      </div>
+                      <div className="text-[10px] text-slate-500 mt-0.5 truncate">ของบริษัทออกให้ร้านค้า</div>
+                    </button>
 
-                {/* 4. Tax Invoice */}
-                <button
-                  type="button"
-                  onClick={() => handleDocTypeSelect('tax_invoice')}
-                  className={`p-2 rounded-lg text-left border transition cursor-pointer ${
-                    selectedDocType === 'tax_invoice'
-                      ? 'bg-amber-50 border-amber-400 text-amber-900 shadow-xs ring-1 ring-amber-400'
-                      : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
-                  }`}
-                >
-                  <div className="flex items-center gap-1.5 font-bold text-xs">
-                    <Receipt className="w-3.5 h-3.5 text-amber-600" />
-                    <span>ใบเสร็จ/กำกับภาษี</span>
+                    {/* 4. Destination Weighbridge Ticket (Col 18-20) */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        handleDocTypeSelect('dest_weighbridge');
+                        setShowDocTypeSwitcher(false);
+                      }}
+                      className={`p-2 rounded-lg text-left border transition cursor-pointer ${
+                        selectedDocType === 'dest_weighbridge' || selectedDocType === 'weighbridge'
+                          ? 'bg-teal-50 border-teal-500 text-teal-950 shadow-xs ring-1 ring-teal-500'
+                          : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                      }`}
+                    >
+                      <div className="flex items-center gap-1.5 font-bold text-xs">
+                        <Scale className="w-3.5 h-3.5 text-teal-600 shrink-0" />
+                        <span className="truncate">ตั๋วชั่งน้ำหนัก</span>
+                      </div>
+                      <div className="text-[10px] text-slate-500 mt-0.5 truncate">ของบริษัท (ช่อง 18-20)</div>
+                    </button>
                   </div>
-                  <div className="text-[10px] text-slate-500 mt-0.5 truncate">ซื้อสินค้าทั่วไป / ยอดชำระเงิน</div>
-                </button>
-
+                </div>
               </div>
+              )}
+              {remappedNotice && (
+                <div className="px-3 py-1.5 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-900 text-[11px] font-semibold flex items-center justify-between">
+                  <span>{remappedNotice}</span>
+                  <button
+                    type="button"
+                    onClick={() => setRemappedNotice(null)}
+                    className="text-emerald-700 hover:text-emerald-950 text-[10px] font-bold cursor-pointer"
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
             </div>
 
             <form onSubmit={handleFormSubmit} className="space-y-3">
               
+              {/* ==================== LINE OA BOT SOURCE METADATA BANNER (SEPARATE FROM PROJECT col2) ==================== */}
+              {(form.lineSenderName || form.lineGroupName) && (
+                <div className="p-3 rounded-xl border border-emerald-300 bg-emerald-50/80 flex flex-wrap items-center justify-between gap-2 text-xs">
+                  <div className="flex items-center gap-2.5 flex-wrap">
+                    <span className="px-2 py-0.5 rounded-md bg-emerald-600 text-white font-bold text-[10px]">
+                      💬 บิลจาก LINE OA Bot
+                    </span>
+                    {form.lineSenderName && (
+                      <span className="text-emerald-950 font-semibold">
+                        👤 ผู้ส่ง: <strong className="font-bold">{form.lineSenderName}</strong>
+                      </span>
+                    )}
+                    {form.lineGroupName && (
+                      <span className="text-emerald-900 bg-white px-2 py-0.5 rounded border border-emerald-200 font-medium">
+                        👥 กลุ่ม LINE: <strong>{form.lineGroupName}</strong>
+                      </span>
+                    )}
+                    {form.lineReceivedAt && (
+                      <span className="text-[11px] text-emerald-700 font-mono">
+                        🕒 {new Date(form.lineReceivedAt).toLocaleString('th-TH')}
+                      </span>
+                    )}
+                  </div>
+                  <span className="text-[10px] font-semibold text-emerald-800 bg-emerald-100/80 px-2 py-0.5 rounded border border-emerald-200">
+                    🔒 เก็บชื่อกลุ่ม LINE แยกต่างหาก (ไม่ผูกเข้าช่อง 2 โครงการอัตโนมัติ)
+                  </span>
+                </div>
+              )}
+
+              {/* ==================== MANDATORY PROJECT (col2) VALIDATION ALERT ==================== */}
+              {projectMissingError && (!form.col2 || !form.col2.trim()) && (
+                <div className="p-3 rounded-xl border-2 border-rose-500 bg-rose-50 text-rose-950 flex items-center justify-between gap-2 animate-fadeIn">
+                  <div className="flex items-center gap-2">
+                    <AlertTriangle className="w-5 h-5 text-rose-600 shrink-0" />
+                    <div>
+                      <div className="font-bold text-xs sm:text-sm">
+                        กรุณาระบุหรือเลือก "2. ชื่อโครงการ / หน้างาน" ก่อนกดยืนยันบันทึก
+                      </div>
+                      <p className="text-[11px] text-rose-800">
+                        ระบบกำหนดให้ช่องที่ 2 (ชื่อโครงการ) ต้องมีข้อมูลเสมอ และแยกอิสระจากชื่อกลุ่ม LINE เพื่อป้องกันข้อมูลโครงการคลาดเคลื่อนภายหลัง
+                      </p>
+                    </div>
+                  </div>
+                  <span className="px-2.5 py-1 rounded-full bg-rose-600 text-white text-[10px] font-bold shrink-0">
+                    จำเป็นต้องระบุ (ช่อง 2)
+                  </span>
+                </div>
+              )}
+
+              {/* ==================== DUPLICATE BILL DETECTION ALERT BANNER ==================== */}
+              {primaryDuplicate && (
+                <div className={`p-3.5 rounded-xl border-2 space-y-2.5 animate-fadeIn ${
+                  primaryDuplicate.level === 'exact'
+                    ? 'bg-rose-50/90 border-rose-400 text-rose-950 shadow-sm'
+                    : primaryDuplicate.level === 'suspected'
+                    ? 'bg-amber-50/90 border-amber-400 text-amber-950 shadow-sm'
+                    : 'bg-emerald-50/90 border-emerald-400 text-emerald-950'
+                }`}>
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex items-start gap-2.5">
+                      {primaryDuplicate.level === 'cross_vendor' ? (
+                        <CheckCircle2 className="w-5 h-5 shrink-0 mt-0.5 text-emerald-600" />
+                      ) : (
+                        <AlertTriangle className={`w-5 h-5 shrink-0 mt-0.5 ${
+                          primaryDuplicate.level === 'exact' ? 'text-rose-600' : 'text-amber-600'
+                        }`} />
+                      )}
+                      <div>
+                        <div className="font-bold text-xs sm:text-sm">
+                          {primaryDuplicate.reasonTitle}
+                        </div>
+                        <p className="text-[11px] opacity-90 mt-0.5 leading-relaxed">
+                          {primaryDuplicate.reasonDetail}
+                        </p>
+                      </div>
+                    </div>
+                    <span className={`px-2.5 py-1 rounded-full text-[10px] font-bold shrink-0 ${
+                      primaryDuplicate.level === 'exact'
+                        ? 'bg-rose-600 text-white'
+                        : primaryDuplicate.level === 'suspected'
+                        ? 'bg-amber-600 text-white'
+                        : 'bg-emerald-600 text-white'
+                    }`}>
+                      {primaryDuplicate.level === 'exact'
+                        ? '🚫 บล็อกบิลซ้ำ (ร้านเดียวกัน)'
+                        : primaryDuplicate.level === 'suspected'
+                        ? '🚫 บล็อกข้อมูลซ้ำ (ร้านเดียวกัน)'
+                        : '✅ คนละร้านค้า — บันทึกได้ปกติ'}
+                    </span>
+                  </div>
+
+                  {/* Comparison summary of the existing record in the system */}
+                  <div className="bg-white/95 p-2.5 rounded-lg border border-slate-200/90 text-[11px] grid grid-cols-2 sm:grid-cols-5 gap-2">
+                    <div>
+                      <span className="text-slate-400 block text-[10px]">รหัสในระบบเดิม</span>
+                      <span className="font-mono font-bold text-slate-900">{primaryDuplicate.matchedOrder.col1}</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-400 block text-[10px]">เลขที่บิล / ตั๋ว</span>
+                      <span className="font-mono font-bold text-blue-800">
+                        {primaryDuplicate.matchedOrder.col6 || primaryDuplicate.matchedOrder.col17 || '-'}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-slate-400 block text-[10px]">วันที่ / ทะเบียน</span>
+                      <span className="font-mono text-slate-800">
+                        {primaryDuplicate.matchedOrder.col7 || primaryDuplicate.matchedOrder.col16 || '-'}
+                        {primaryDuplicate.matchedOrder.col10 ? ` (${primaryDuplicate.matchedOrder.col10})` : ''}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-slate-400 block text-[10px]">ร้านค้าในระบบเดิม</span>
+                      <span className="font-semibold text-slate-800 truncate block">
+                        {primaryDuplicate.matchedOrder.col8} • {primaryDuplicate.matchedOrder.col11}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-slate-400 block text-[10px]">น้ำหนักสุทธิ / ยอดรวม</span>
+                      <span className="font-mono font-bold text-emerald-800">
+                        {Number(primaryDuplicate.matchedOrder.col15) > 0
+                          ? `${Number(primaryDuplicate.matchedOrder.col15).toLocaleString()} กก.`
+                          : Number(primaryDuplicate.matchedOrder.col20) > 0
+                          ? `${Number(primaryDuplicate.matchedOrder.col20).toLocaleString()} กก.`
+                          : `฿${(Number(primaryDuplicate.matchedOrder.col29) || 0).toLocaleString()}`}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Action Buttons: Only show Duplicate Block actions when level is exact or suspected */}
+                  {primaryDuplicate.level === 'cross_vendor' ? (
+                    <div className="flex items-center justify-between gap-2 pt-0.5 text-[11px] text-emerald-900 font-semibold">
+                      <span>💡 เนื่องจากเป็นบิลคนละร้านค้ากัน ระบบจึงไม่ตัดออก สามารถกดปุ่ม "บันทึกข้อมูลเอกสาร" ด้านล่างได้ตามปกติ</span>
+                    </div>
+                  ) : (
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={onClose}
+                          className="px-3.5 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-xs font-bold shadow-xs transition cursor-pointer flex items-center gap-1.5"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                          <span>ยกเลิกการนำเข้าบิลซ้ำนี้ (ไม่บันทึกเข้าระบบ)</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleInspectExistingDuplicate(primaryDuplicate.matchedOrder)}
+                          className="px-3 py-1.5 bg-white hover:bg-slate-100 text-slate-800 border border-slate-300 rounded-lg text-xs font-bold transition cursor-pointer"
+                        >
+                          👁️ เปิดดูบิลเดิมที่มีอยู่ในระบบ ({primaryDuplicate.matchedOrder.col1})
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleOverwriteExistingDuplicate(primaryDuplicate.matchedOrder)}
+                          className="px-2.5 py-1.5 bg-blue-50 hover:bg-blue-100 text-blue-800 border border-blue-300 rounded-lg text-[11px] font-semibold transition cursor-pointer"
+                          title="กรณีต้องการอัปเดตข้อมูลหรือรูปภาพใหม่ทับลงในบิลเดิมโดยไม่เพิ่มแถวใหม่"
+                        >
+                          🔄 อัปเดตทับบิลเดิม ({primaryDuplicate.matchedOrder.col1})
+                        </button>
+                      </div>
+
+                      <span className="text-[11px] font-bold text-rose-800 bg-rose-100/90 px-2.5 py-1 rounded-lg border border-rose-300">
+                        🔒 ระบบล็อกปุ่มบันทึกแล้ว (ร้านเดียวกัน + เลขบิลซ้ำ)
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* Auto Store Directory Option */}
               <div className="flex items-center justify-between text-xs px-1">
                 <label className="flex items-center gap-1.5 text-slate-700 cursor-pointer font-medium">
@@ -448,9 +923,50 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                 </label>
               </div>
 
+              {/* ==================== AUTO-ACTION VERIFICATION BANNER (MANDATORY HUMAN REVIEW) ==================== */}
+              {(form.poMatchStatus === 'auto_flagged' ||
+                form.destMatchStatus === 'auto_flagged' ||
+                (form.autoActionFlags && form.autoActionFlags.length > 0 && !form.autoFlagsVerified)) && (
+                <div className="p-3 rounded-xl border-2 border-amber-400 bg-amber-50/90 text-amber-950 space-y-2 animate-fadeIn">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="space-y-1">
+                      <div className="font-bold text-xs flex items-center gap-1.5 text-amber-950">
+                        <span>🚩 รายการที่ระบบทำอัตโนมัติ — กรุณาตรวจสอบและยืนยันความถูกต้อง</span>
+                      </div>
+                      <ul className="list-disc list-inside text-[11px] text-amber-900 space-y-0.5 font-medium">
+                        {form.poMatchStatus === 'auto_flagged' && form.col4 && (
+                          <li>ชนใบสั่งซื้อ (PO) ช่อง 4 อัตโนมัติตามเลขอ้างอิง: <strong>{form.col4}</strong></li>
+                        )}
+                        {form.destMatchStatus === 'auto_flagged' && (
+                          <li>ชนตั๋วชั่งน้ำหนักปลายทาง โซน 4 อัตโนมัติตามเลขอ้างอิง DO: <strong>{form.col17 || form.linkedViaDocNo}</strong></li>
+                        )}
+                        {(form.autoActionFlags || []).map((flag, idx) => (
+                          <li key={idx}>{flag}</li>
+                        ))}
+                      </ul>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setForm(prev => ({
+                          ...prev,
+                          poMatchStatus: prev.col4 ? 'verified' : prev.poMatchStatus,
+                          destMatchStatus: (prev.col17 || Number(prev.col20) > 0 || prev.linkedViaDocNo) ? 'verified' : prev.destMatchStatus,
+                          autoFlagsVerified: true
+                        }))
+                      }
+                      className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold shadow-xs cursor-pointer transition shrink-0"
+                    >
+                      ✅ ยืนยันความถูกต้องทั้งหมด
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {/* Active Document Type Banner */}
               <div className={`p-2.5 rounded-xl border flex items-center justify-between text-xs ${
                 selectedDocType === 'delivery_order' ? 'bg-sky-50 border-sky-200 text-sky-900' :
+                selectedDocType === 'dest_weighbridge' ? 'bg-teal-50 border-teal-300 text-teal-950' :
                 selectedDocType === 'weighbridge' ? 'bg-emerald-50 border-emerald-200 text-emerald-900' :
                 selectedDocType === 'tax_invoice' ? 'bg-amber-50 border-amber-200 text-amber-900' :
                 selectedDocType === 'purchase_order' ? 'bg-indigo-50 border-indigo-200 text-indigo-900' :
@@ -458,20 +974,22 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
               }`}>
                 <div className="flex items-center gap-2">
                   {selectedDocType === 'delivery_order' && <Boxes className="w-4 h-4 text-sky-600 shrink-0" />}
-                  {selectedDocType === 'weighbridge' && <Scale className="w-4 h-4 text-emerald-600 shrink-0" />}
+                  {(selectedDocType === 'dest_weighbridge' || selectedDocType === 'weighbridge') && <Scale className="w-4 h-4 text-teal-600 shrink-0" />}
                   {selectedDocType === 'tax_invoice' && <Receipt className="w-4 h-4 text-amber-600 shrink-0" />}
                   {selectedDocType === 'purchase_order' && <FileText className="w-4 h-4 text-indigo-600 shrink-0" />}
                   <div>
                     <span className="font-bold block">
-                      {selectedDocType === 'delivery_order' ? 'ฟอร์มใบส่งของ (DO) / สินค้าทั่วไป & คอนกรีต' :
-                       selectedDocType === 'weighbridge' ? 'ฟอร์มตั๋วชั่งน้ำหนักรถบรรทุก (หิน, ดิน, ทราย)' :
+                      {selectedDocType === 'delivery_order' ? 'ฟอร์มใบส่งของ (DO) — เก็บตารางหลัก 39 คอลัมน์ (น้ำหนักต้นทาง ช่อง 13, 14, 15)' :
+                       selectedDocType === 'dest_weighbridge' ? 'ฟอร์มตั๋วชั่งน้ำหนักปลายทาง — เก็บลง [โซน 4: ช่อง 18, 19, 20] เพื่อชนบิลกับ DO' :
+                       selectedDocType === 'weighbridge' ? 'ฟอร์มตั๋วชั่งน้ำหนักต้นทาง (กรณีใช้แทน DO — เก็บลงช่อง 13, 14, 15)' :
                        selectedDocType === 'tax_invoice' ? 'ฟอร์มใบเสร็จรับเงิน / ใบกำกับภาษี (Tax Invoice)' :
                        selectedDocType === 'purchase_order' ? 'ฟอร์มใบสั่งซื้อสินค้า (PO)' : 'ฟอร์มโลจิสติกส์เต็มรูปแบบ'}
                     </span>
                     <span className="text-[11px] block opacity-80">
                       {showAllCols ? 'แสดงทุกฟิลด์ (ครบ 39 คอลัมน์)' :
-                       selectedDocType === 'delivery_order' ? 'แสดงเฉพาะฟิลด์ส่งของและรายการสินค้า (ซ่อนช่องตราชั่งรถบรรทุกที่ไม่เกี่ยวข้อง)' :
-                       selectedDocType === 'weighbridge' ? 'แสดงน้ำหนักชั่งเข้า/ออก และแปลงเป็นปริมาณตัน (ซ่อนชั่งปลายทางเพื่อไม่ให้ตัวเลขซ้ำซ้อน)' :
+                       selectedDocType === 'delivery_order' ? 'แสดงฟิลด์ใบส่งของ (DO) และน้ำหนักต้นทาง ช่อง 13 (หนัก Gross), 14 (เบา Tare), 15 (สุทธิ Net)' :
+                       selectedDocType === 'dest_weighbridge' ? 'บันทึก 18. หนักเข้า (Gross), 19. เบาออก (Tare), 20. น้ำหนักสุทธิ (Net) เพื่อนำไปชนกับใบส่งของ (DO)' :
+                       selectedDocType === 'weighbridge' ? 'แสดงน้ำหนักชั่งต้นทาง ช่อง 13-15 (สามารถกดสลับเป็นโหมดตั๋วชั่งปลายทาง ช่อง 18-20 ได้)' :
                        selectedDocType === 'tax_invoice' ? 'แสดงเฉพาะเลขผู้เสียภาษี 13 หลัก รายการสินค้า และยอดเงิน (ซ่อนน้ำหนักตราชั่ง)' :
                        'ระบบปรับฟิลด์ตามบริบทเอกสาร'}
                     </span>
@@ -498,42 +1016,7 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                     <button
                       type="button"
                       onClick={() => {
-                        onSwitchToPO({
-                          poNumber: form.col4 || form.col6 || 'PO-' + new Date().getFullYear() + '-' + Math.floor(100 + Math.random() * 900),
-                          orderDate: form.col7 || new Date().toISOString().split('T')[0],
-                          storeName: form.col8 || 'ไม่ระบุผู้ขาย',
-                          projectId: form.col2 || '',
-                          category: form.col3 || '',
-                          items: form.lineItems && form.lineItems.length > 0
-                            ? form.lineItems.map((i, idx) => ({
-                                id: `item-${Date.now()}-${idx}`,
-                                itemDescription: i.itemDescription,
-                                specCode: i.specCode || '',
-                                orderedQty: i.qty || 1,
-                                unit: i.unit || 'ชิ้น',
-                                unitPrice: i.unitPrice || 0,
-                                totalAmount: i.totalAmount || 0
-                              }))
-                            : [{
-                                id: `item-${Date.now()}-0`,
-                                itemDescription: form.col11 || 'สินค้าทั่วไป',
-                                specCode: form.col12 || '',
-                                orderedQty: Number(form.col22) || 1,
-                                unit: form.col23 || 'ชิ้น',
-                                unitPrice: Number(form.col24) || 0,
-                                totalAmount: Number(form.col25) || Number(form.col29) || 0
-                              }],
-                          totalQty: Number(form.col22) || 1,
-                          totalAmount: Number(form.col29) || Number(form.col25) || 0,
-                          status: 'pending',
-                          creditTerms: form.col30 || 'เครดิต 30 วัน',
-                          deliveryLocation: form.col37 || '',
-                          orderedBy: form.col9 || '',
-                          notes: form.col38 || '',
-                          image: currentImage || form.image || null,
-                          createdAt: new Date().toISOString(),
-                          updatedAt: new Date().toISOString()
-                        });
+                        onSwitchToPO(convertOrderDraftToPODraft(form, currentImage));
                         onClose();
                       }}
                       className="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-bold flex items-center gap-1.5 transition cursor-pointer text-xs"
@@ -562,7 +1045,7 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                     <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
                       <div className="col-span-2 sm:col-span-1">
                         <label className="block text-[11px] font-bold text-sky-950 mb-0.5">
-                          6. เลขที่ DO / ใบส่งของ <span className="text-rose-500">*</span>
+                          6. เลขที่ DO / ใบส่งของ (เล่มที่/เลขที่) <span className="text-rose-500">*</span>
                         </label>
                         <input
                           type="text"
@@ -570,13 +1053,13 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                           value={form.col6 || ''}
                           onChange={(e) => handleTextChange('col6', e.target.value)}
                           className="w-full p-2 border border-sky-300 rounded-lg bg-white font-mono font-bold text-sky-900"
-                          placeholder="DO-xxxxx หรือ เลขที่บิลส่งของ"
+                          placeholder="เช่น 03/0125 (เล่มที่/เลขที่) หรือ DO-xxxxx"
                         />
                       </div>
                       <div>
                         <div className="flex items-center justify-between mb-0.5">
                           <label className="block text-[11px] font-semibold text-slate-700 flex items-center gap-1.5">
-                            <span>4. เลขที่ PO อ้างอิง</span>
+                            <span>4. เลขที่ PO อ้างอิง (เล่มที่/เลขที่)</span>
                             {form.referenceSource === 'handwritten' && (
                               <span className="text-[10px] font-normal text-amber-700 bg-amber-50 px-1.5 py-0.2 rounded border border-amber-200">✍️ ลายมือ</span>
                             )}
@@ -595,28 +1078,67 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                           className="w-full p-2 border border-slate-300 rounded-lg bg-white font-mono text-slate-800"
                           placeholder="PO-xxxxx (AI เติมให้อัตโนมัติ)"
                         />
-                        {pos && pos.length > 0 && (
-                          <div className="mt-1 flex items-center gap-1 text-[10px] text-slate-500">
-                            <span>หรือเลือก PO:</span>
-                            <select
-                              className="text-[10px] bg-slate-50 border border-slate-200 rounded px-1 py-0.5 max-w-[130px] truncate"
-                              value={form.col4 || ''}
-                              onChange={(e) => {
-                                if (e.target.value) {
-                                  handleTextChange('col4', e.target.value);
-                                  handleTextChange('referenceDocNo', e.target.value);
-                                }
-                              }}
-                            >
-                              <option value="">-- เลือก PO ในระบบ --</option>
-                              {pos.map(p => (
-                                <option key={p.id} value={p.poNumber}>
-                                  {p.poNumber} ({p.storeName})
-                                </option>
-                              ))}
-                            </select>
-                          </div>
-                        )}
+                        {pos && pos.length > 0 && (() => {
+                          const matchedPO = form.col4
+                            ? pos.find(p => isDocNumberMatch(p.poNumber, form.col4))
+                            : undefined;
+                          return (
+                            <div className="mt-1 space-y-1">
+                              {matchedPO && (
+                                <div className="px-2 py-1 rounded bg-emerald-50 border border-emerald-300 text-[10px] font-bold text-emerald-800 space-y-0.5">
+                                  <div className="flex items-center justify-between gap-1">
+                                    <span>✅ ชนกับ PO: {matchedPO.poNumber}</span>
+                                    <span className="font-normal text-emerald-700 truncate max-w-[110px]">{matchedPO.storeName}</span>
+                                  </div>
+                                  {form.col4 && form.col4.trim() !== matchedPO.poNumber && (
+                                    <div className="flex items-center justify-between pt-0.5 border-t border-emerald-200/60">
+                                      <span className="text-[9px] font-normal text-emerald-700">บิลระบุ "{form.col4}" (ชนอัตโนมัติ)</span>
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          handleTextChange('col4', matchedPO.poNumber);
+                                          handleTextChange('referenceDocNo', matchedPO.poNumber);
+                                        }}
+                                        className="text-[9px] bg-white hover:bg-emerald-100 text-emerald-800 px-1.5 py-0.2 rounded border border-emerald-300 font-semibold cursor-pointer"
+                                      >
+                                        ใช้รหัสเต็ม {matchedPO.poNumber}
+                                      </button>
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                              <div className="flex items-center gap-1 text-[10px] text-slate-500">
+                                <span>หรือเลือก PO:</span>
+                                <select
+                                  className="text-[10px] bg-slate-50 border border-slate-200 rounded px-1 py-0.5 max-w-[130px] truncate"
+                                  value={matchedPO ? matchedPO.poNumber : (form.col4 || '')}
+                                  onChange={(e) => {
+                                    const pickedNo = e.target.value;
+                                    if (pickedNo) {
+                                      const pickedPO = pos.find(p => p.poNumber === pickedNo);
+                                      setForm(prev => ({
+                                        ...prev,
+                                        col4: pickedNo,
+                                        referenceDocNo: pickedNo,
+                                        col2: (!prev.col2 || prev.col2 === 'โครงการทั่วไป') && pickedPO?.projectId ? pickedPO.projectId : prev.col2,
+                                        col3: (!prev.col3 || prev.col3 === 'ทั่วไป' || prev.col3 === 'วัสดุก่อสร้างทั่วไป') && pickedPO?.category ? pickedPO.category : prev.col3,
+                                        col8: (!prev.col8 || prev.col8 === 'ไม่ระบุผู้ขาย') && pickedPO?.storeName ? pickedPO.storeName : prev.col8,
+                                        col37: !prev.col37 && pickedPO?.deliveryLocation ? pickedPO.deliveryLocation : prev.col37
+                                      }));
+                                    }
+                                  }}
+                                >
+                                  <option value="">-- เลือก PO ในระบบ --</option>
+                                  {pos.map(p => (
+                                    <option key={p.id} value={p.poNumber}>
+                                      {p.poNumber} ({p.storeName})
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
+                            </div>
+                          );
+                        })()}
                       </div>
                       <div>
                         <label className="block text-[11px] font-semibold text-slate-700 mb-0.5">7. วันที่ส่งมอบ</label>
@@ -628,21 +1150,53 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                         />
                       </div>
                       <div>
-                        <label className="block text-[11px] font-semibold text-slate-700 mb-0.5">2. โครงการ / หน้างาน</label>
-                        <input
-                          type="text"
+                        <label className="block text-[11px] font-bold text-slate-800 mb-0.5">
+                          2. โครงการ / หน้างาน <span className="text-rose-500">* (ต้องระบุก่อนบันทึก)</span>
+                        </label>
+                        <SmartDatabaseInput
+                          required
                           value={form.col2 || ''}
-                          onChange={(e) => handleTextChange('col2', e.target.value)}
-                          className="w-full p-2 border border-slate-300 rounded-lg bg-white"
-                          placeholder="เช่น อาคาร A, โครงการถนน"
+                          onChange={(val) => handleTextChange('col2', val)}
+                          onSelectOption={(opt) => {
+                            handleTextChange('col2', opt.value);
+                            if (!form.col37 && opt.meta?.location) {
+                              handleTextChange('col37', opt.meta.location);
+                            }
+                          }}
+                          options={dbCatalog.projects}
+                          showStatusBadge={true}
+                          fieldLabel="โครงการ"
+                          className={`w-full p-2 border rounded-lg bg-white font-semibold ${
+                            !form.col2?.trim() ? 'border-amber-400 ring-1 ring-amber-300 bg-amber-50/30' : 'border-slate-300'
+                          }`}
+                          placeholder="เลือกหรือพิมพ์ชื่อโครงการ (จำเป็นต้องระบุ)"
+                        />
+                      </div>
+                      <div>
+                        <div className="flex items-center justify-between mb-0.5">
+                          <label className="block text-[11px] font-semibold text-slate-700">3. หมวดหมู่ (วัสดุ)</label>
+                          <span className="text-[9px] px-1.5 py-0.2 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 font-semibold" title="ระบบวิเคราะห์และดึงให้อัตโนมัติจากชื่อสินค้า ร้านค้า หรือ PO (แก้ไขได้)">
+                            ✨ ออโต้
+                          </span>
+                        </div>
+                        <SmartDatabaseInput
+                          value={form.col3 || ''}
+                          onChange={(val) => handleTextChange('col3', val)}
+                          options={dbCatalog.categories}
+                          showStatusBadge={false}
+                          fieldLabel="หมวดหมู่วัสดุ"
+                          className="w-full p-2 border border-slate-300 rounded-lg bg-white text-slate-800"
+                          placeholder="เช่น หิน/ดิน/ทราย, คอนกรีต, เหล็ก"
                         />
                       </div>
                       <div>
                         <label className="block text-[11px] font-semibold text-slate-700 mb-0.5">10. ทะเบียนรถขนส่ง</label>
-                        <input
-                          type="text"
+                        <SmartDatabaseInput
                           value={form.col10 || ''}
-                          onChange={(e) => handleTextChange('col10', e.target.value)}
+                          onChange={(val) => handleTextChange('col10', val)}
+                          options={dbCatalog.licensePlates}
+                          showStatusBadge={true}
+                          fieldLabel="ทะเบียนรถ"
                           className="w-full p-2 border border-slate-300 rounded-lg bg-white font-mono"
                           placeholder="เช่น 70-1234 กทม."
                         />
@@ -657,7 +1211,7 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                         <span className="w-2.5 h-2.5 rounded-full bg-blue-500"></span>
                         <span>คู่ค้าผู้จำหน่าย & รายการสินค้าส่งมอบ</span>
                       </span>
-                      <span className="text-[11px] text-slate-500">Supplier & Items</span>
+                      <span className="text-[11px] text-slate-500">คลิกเพื่อกรองเลือกจากฐานข้อมูล หรือพิมพ์ใหม่</span>
                     </div>
 
                     <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
@@ -665,21 +1219,32 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                         <label className="block text-[11px] font-bold text-slate-800 mb-0.5">
                           8. ผู้จำหน่าย / ร้านค้า <span className="text-rose-500">*</span>
                         </label>
-                        <input
-                          type="text"
+                        <SmartDatabaseInput
                           required
                           value={form.col8 || ''}
-                          onChange={(e) => handleTextChange('col8', e.target.value)}
+                          onChange={(val) => handleTextChange('col8', val)}
+                          onSelectOption={(opt) => {
+                            handleTextChange('col8', opt.value);
+                            if (opt.meta?.category && (!form.col3 || form.col3 === 'ทั่วไป')) {
+                              handleTextChange('col3', opt.meta.category);
+                            }
+                          }}
+                          options={dbCatalog.stores}
+                          isStoreField={true}
+                          showStatusBadge={true}
+                          fieldLabel="ร้านค้า"
                           className="w-full p-2 border border-slate-300 rounded-lg bg-white font-bold text-slate-900"
                           placeholder="เช่น บจก. สหพาณิชย์ หรือ แพลนท์ CPAC"
                         />
                       </div>
                       <div className="col-span-2">
                         <label className="block text-[11px] font-semibold text-slate-700 mb-0.5">9. ผู้รับสินค้า / ผู้ซื้อ</label>
-                        <input
-                          type="text"
+                        <SmartDatabaseInput
                           value={form.col9 || ''}
-                          onChange={(e) => handleTextChange('col9', e.target.value)}
+                          onChange={(val) => handleTextChange('col9', val)}
+                          options={dbCatalog.buyersAndStaff}
+                          showStatusBadge={false}
+                          fieldLabel="ผู้รับสินค้า"
                           className="w-full p-2 border border-slate-300 rounded-lg bg-white"
                           placeholder="ชื่อบริษัทหรือวิศวกรผู้รับของ"
                         />
@@ -688,23 +1253,81 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                         <label className="block text-[11px] font-bold text-blue-950 mb-0.5">
                           11. รายการสินค้าหลัก <span className="text-rose-500">*</span>
                         </label>
-                        <input
-                          type="text"
+                        <SmartDatabaseInput
                           required
                           value={form.col11 || ''}
-                          onChange={(e) => handleTextChange('col11', e.target.value)}
+                          onChange={(val) => {
+                            const nextCol3 = inferMaterialCategory(val, undefined, undefined, undefined);
+                            setForm(prev => ({
+                              ...prev,
+                              col11: val,
+                              col3: (!prev.col3 || prev.col3 === 'ทั่วไป' || prev.col3 === 'วัสดุก่อสร้างทั่วไป' || nextCol3 !== 'วัสดุก่อสร้างทั่วไป')
+                                ? nextCol3
+                                : prev.col3
+                            }));
+                          }}
+                          onSelectOption={(opt) => {
+                            const inferredCat = inferMaterialCategory(opt.value, undefined, undefined, undefined);
+                            const nextForm = {
+                              ...form,
+                              col11: opt.value,
+                              col3: (!form.col3 || form.col3 === 'ทั่วไป' || form.col3 === 'วัสดุก่อสร้างทั่วไป' || inferredCat !== 'วัสดุก่อสร้างทั่วไป')
+                                ? inferredCat
+                                : form.col3
+                            };
+                            if (!nextForm.col12 && opt.meta?.specCode) {
+                              nextForm.col12 = opt.meta.specCode;
+                            }
+                            if ((!nextForm.col23 || nextForm.col23 === 'รายการ') && opt.meta?.unit) {
+                              nextForm.col23 = opt.meta.unit;
+                            }
+                            if (!nextForm.col24 && opt.meta?.unitPrice) {
+                              nextForm.col24 = Number(opt.meta.unitPrice) || 0;
+                            }
+                            recalculateFinancials(nextForm);
+                          }}
+                          options={poAwareItemOptions}
+                          showStatusBadge={true}
+                          fieldLabel="รายการสินค้า"
                           className="w-full p-2 border border-blue-300 rounded-lg bg-white font-bold text-blue-900"
                           placeholder="เช่น เหล็กเส้นกลม RB9, ท่อ PVC 2 นิ้ว, 280 KSC Cube"
                         />
+                        {/(?:หมายเหตุ|Remark|Note|เงื่อนไข|สถานที่ส่ง|จัดส่งที่|ส่งที่|ติดต่อ|โทร\.?)/i.test(form.col11 || '') && (
+                          <div className="mt-1 flex items-center justify-between gap-1 bg-amber-50 border border-amber-200 rounded px-2 py-1 text-[10px] text-amber-900">
+                            <span>💡 พบข้อความหมายเหตุปะปนในชื่อสินค้า</span>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const raw = (form.col11 || '').trim();
+                                const splitRegex = /^(.*?)(?:\s+[-–—|/]+\s*|\s*[(（]\s*|\s+)((?:หมายเหตุ|Remark|Note|เงื่อนไข|สถานที่ส่ง|จัดส่งที่|ส่งที่|ติดต่อ|โทร\.?).*)$/i;
+                                const m = splitRegex.exec(raw);
+                                if (m && m[1]?.trim()) {
+                                  const cleanName = m[1].trim();
+                                  const extracted = m[2].replace(/[)）]$/, '').replace(/^(?:หมายเหตุ|Remark|Note)\s*[:：-]?\s*/i, '').trim();
+                                  setForm(prev => ({
+                                    ...prev,
+                                    col11: cleanName,
+                                    col38: prev.col38 ? `${prev.col38} | ${extracted}` : extracted
+                                  }));
+                                }
+                              }}
+                              className="px-1.5 py-0.5 bg-amber-600 hover:bg-amber-700 text-white rounded font-semibold cursor-pointer shrink-0"
+                            >
+                              ✂️ แยกหมายเหตุไปช่อง 38
+                            </button>
+                          </div>
+                        )}
                       </div>
                       <div className="col-span-2">
                         <label className="block text-[11px] font-semibold text-slate-700 mb-0.5">
                           12. สเปก / Code / Slump <span className="text-slate-400 font-normal">(ทางเลือก - เว้นว่างได้หากไม่มีสเปกเฉพาะ)</span>
                         </label>
-                        <input
-                          type="text"
+                        <SmartDatabaseInput
                           value={form.col12 || ''}
-                          onChange={(e) => handleTextChange('col12', e.target.value)}
+                          onChange={(val) => handleTextChange('col12', val)}
+                          options={dbCatalog.specs}
+                          showStatusBadge={false}
+                          fieldLabel="สเปก"
                           className="w-full p-2 border border-slate-300 rounded-lg bg-white font-mono text-slate-700"
                           placeholder="เช่น SD40, Slump 10±2.5 cm, มอก. (หรือเว้นว่างได้)"
                         />
@@ -719,34 +1342,129 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                             <Boxes className="w-3.5 h-3.5 text-sky-600" />
                             <span>รายการสินค้าย่อยในใบส่งของ ({form.lineItems.length} รายการ)</span>
                           </span>
-                          <span className="text-[10px] text-slate-500 font-normal">สกัดรายการสินค้าทั่วไป</span>
+                          <span className="text-[10px] text-slate-500 font-normal">สามารถคลิกกรองเลือกชื่อสินค้าจากฐานข้อมูล หรือย้ายแถวหมายเหตุออกได้</span>
                         </div>
-                        <div className="overflow-x-auto max-h-48 border border-slate-200 rounded bg-white">
-                          <table className="w-full min-w-[640px] text-[11px] text-left border-collapse">
-                            <thead className="bg-slate-100 text-slate-700 border-b border-slate-200 sticky top-0">
+                        <div className="overflow-visible border border-slate-200 rounded bg-white">
+                          <table className="w-full text-[11px] text-left border-collapse">
+                            <thead className="bg-slate-100 text-slate-700 border-b border-slate-200">
                               <tr>
                                 <th className="p-1.5 w-8 text-center">#</th>
-                                <th className="p-1.5 min-w-[220px]">รายการสินค้า (Description)</th>
+                                <th className="p-1.5">รายการสินค้า (Description)</th>
                                 <th className="p-1.5 w-24">สเปก</th>
                                 <th className="p-1.5 text-right w-16">จำนวน</th>
-                                <th className="p-1.5 text-center w-16">หน่วย</th>
+                                <th className="p-1.5 text-center w-20">หน่วย</th>
                                 <th className="p-1.5 text-right w-20">ราคา/หน่วย</th>
                                 <th className="p-1.5 text-right w-24">รวมเงิน</th>
+                                <th className="p-1.5 text-center w-14">จัดการ</th>
                               </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-100">
                               {form.lineItems.map((item, idx) => (
-                                <tr key={idx} className="hover:bg-slate-50/50">
-                                  <td className="p-1.5 text-center text-slate-400 font-mono">{idx + 1}</td>
-                                  <td className="p-1.5 font-medium text-slate-900 min-w-[220px]">{item.itemDescription}</td>
-                                  <td className="p-1.5 text-slate-500 font-mono">{item.specCode || '-'}</td>
-                                  <td className="p-1.5 text-right font-mono font-bold text-slate-800">{item.qty}</td>
-                                  <td className="p-1.5 text-center text-slate-600">{item.unit}</td>
-                                  <td className="p-1.5 text-right font-mono text-slate-700">
+                                <tr key={idx} className="hover:bg-slate-50/50 align-top">
+                                  <td className="p-1.5 text-center text-slate-400 font-mono pt-2.5">{idx + 1}</td>
+                                  <td className="p-1.5 font-medium text-slate-900">
+                                    <SmartDatabaseInput
+                                      value={item.itemDescription || ''}
+                                      onChange={(val) => {
+                                        const nextLines = [...(form.lineItems || [])];
+                                        nextLines[idx] = { ...nextLines[idx], itemDescription: val };
+                                        setForm(prev => ({ ...prev, lineItems: nextLines }));
+                                      }}
+                                      onSelectOption={(opt) => {
+                                        const nextLines = [...(form.lineItems || [])];
+                                        nextLines[idx] = {
+                                          ...nextLines[idx],
+                                          itemDescription: opt.value,
+                                          specCode: nextLines[idx].specCode || opt.meta?.specCode || '',
+                                          unit: nextLines[idx].unit || opt.meta?.unit || 'ชิ้น',
+                                          unitPrice: nextLines[idx].unitPrice || opt.meta?.unitPrice || 0
+                                        };
+                                        setForm(prev => ({ ...prev, lineItems: nextLines }));
+                                      }}
+                                      options={poAwareItemOptions}
+                                      showStatusBadge={true}
+                                      fieldLabel="สินค้าย่อย"
+                                      className="w-full p-1 border border-slate-200 rounded bg-white text-[11px]"
+                                    />
+                                  </td>
+                                  <td className="p-1.5">
+                                    <input
+                                      type="text"
+                                      value={item.specCode || ''}
+                                      onChange={(e) => {
+                                        const nextLines = [...(form.lineItems || [])];
+                                        nextLines[idx] = { ...nextLines[idx], specCode: e.target.value };
+                                        setForm(prev => ({ ...prev, lineItems: nextLines }));
+                                      }}
+                                      className="w-full p-1 border border-slate-200 rounded bg-white font-mono text-[11px]"
+                                      placeholder="-"
+                                    />
+                                  </td>
+                                  <td className="p-1.5">
+                                    <input
+                                      type="number"
+                                      step="any"
+                                      value={item.qty || 0}
+                                      onChange={(e) => {
+                                        const q = parseFloat(e.target.value) || 0;
+                                        const nextLines = [...(form.lineItems || [])];
+                                        const p = Number(nextLines[idx].unitPrice) || 0;
+                                        nextLines[idx] = { ...nextLines[idx], qty: q, totalAmount: Number((q * p).toFixed(2)) };
+                                        setForm(prev => ({ ...prev, lineItems: nextLines }));
+                                      }}
+                                      className="w-full p-1 border border-slate-200 rounded bg-white text-right font-mono font-bold text-[11px]"
+                                    />
+                                  </td>
+                                  <td className="p-1.5">
+                                    <SmartDatabaseInput
+                                      value={item.unit || ''}
+                                      onChange={(val) => {
+                                        const nextLines = [...(form.lineItems || [])];
+                                        nextLines[idx] = { ...nextLines[idx], unit: val };
+                                        setForm(prev => ({ ...prev, lineItems: nextLines }));
+                                      }}
+                                      options={dbCatalog.units}
+                                      showStatusBadge={false}
+                                      fieldLabel="หน่วย"
+                                      className="w-full p-1 border border-slate-200 rounded bg-white text-center text-[11px]"
+                                    />
+                                  </td>
+                                  <td className="p-1.5 text-right font-mono text-slate-700 pt-2">
                                     {item.unitPrice ? `฿${item.unitPrice.toLocaleString()}` : '-'}
                                   </td>
-                                  <td className="p-1.5 text-right font-mono font-bold text-slate-900">
+                                  <td className="p-1.5 text-right font-mono font-bold text-slate-900 pt-2">
                                     {item.totalAmount ? `฿${item.totalAmount.toLocaleString()}` : '-'}
+                                  </td>
+                                  <td className="p-1.5 text-center pt-1.5">
+                                    <div className="flex items-center justify-center gap-0.5">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          const textToMove = [item.itemDescription, item.specCode].filter(Boolean).join(' ').trim();
+                                          const nextLines = (form.lineItems || []).filter((_, i) => i !== idx);
+                                          setForm(prev => ({
+                                            ...prev,
+                                            lineItems: nextLines,
+                                            col38: prev.col38 ? `${prev.col38} | ${textToMove}` : textToMove
+                                          }));
+                                        }}
+                                        className="p-1 text-slate-400 hover:text-amber-700 hover:bg-amber-50 rounded transition cursor-pointer"
+                                        title="ย้ายแถวนี้ไปไว้ในช่อง 38. หมายเหตุ"
+                                      >
+                                        💬
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          const nextLines = (form.lineItems || []).filter((_, i) => i !== idx);
+                                          setForm(prev => ({ ...prev, lineItems: nextLines }));
+                                        }}
+                                        className="p-1 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded transition cursor-pointer"
+                                        title="ลบแถวนี้"
+                                      >
+                                        ✕
+                                      </button>
+                                    </div>
                                   </td>
                                 </tr>
                               ))}
@@ -782,10 +1500,21 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
 
                     {enableDOWeighing && (
                       <div className="space-y-2 pt-1 animate-fadeIn">
+                        <div className="flex items-center justify-between text-[11px] text-emerald-800 bg-emerald-100/60 px-2.5 py-1 rounded-lg">
+                          <span>💡 <strong>หมายเหตุต้นทาง:</strong> บิลโรงโม่มักชั่งรถเปล่าตอนเข้า (Tare) และชั่งรถมีของตอนออก (Gross) ระบบจัดให้ช่อง 13 เป็นค่าหนัก (Gross) เสมอ</span>
+                          <button
+                            type="button"
+                            onClick={handleSwapOriginWeights}
+                            className="px-2 py-0.5 bg-white hover:bg-emerald-50 text-emerald-900 border border-emerald-300 rounded font-bold text-[10px] cursor-pointer shrink-0 shadow-2xs transition"
+                            title="คลิกเพื่อสลับตัวเลขระหว่างช่อง 13 กับ ช่อง 14"
+                          >
+                            ⇄ สลับค่า 13 ↔ 14
+                          </button>
+                        </div>
                         <div className="grid grid-cols-3 gap-2">
                           <div>
                             <label className="block text-[11px] font-bold text-slate-700 mb-0.5">
-                              13. หนักเข้า (Gross กก.)
+                              13. น้ำหนักหนัก / รวมของ (Gross กก.)
                             </label>
                             <input
                               type="number"
@@ -797,7 +1526,7 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                           </div>
                           <div>
                             <label className="block text-[11px] font-bold text-slate-700 mb-0.5">
-                              14. เบาออก (Tare กก.)
+                              14. น้ำหนักเบา / รถเปล่า (Tare กก.)
                             </label>
                             <input
                               type="number"
@@ -809,7 +1538,7 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                           </div>
                           <div>
                             <label className="block text-[11px] font-bold text-emerald-900 mb-0.5">
-                              15. น้ำหนักสุทธิ (Net กก.)
+                              15. น้ำหนักสุทธิต้นทาง (Net กก.)
                             </label>
                             <input
                               type="number"
@@ -862,10 +1591,12 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                       </div>
                       <div>
                         <label className="block text-[11px] font-semibold text-slate-700 mb-0.5">23. หน่วยนับ</label>
-                        <input
-                          type="text"
+                        <SmartDatabaseInput
                           value={form.col23 || ''}
-                          onChange={(e) => handleTextChange('col23', e.target.value)}
+                          onChange={(val) => handleTextChange('col23', val)}
+                          options={dbCatalog.units}
+                          showStatusBadge={false}
+                          fieldLabel="หน่วยนับ"
                           className="w-full p-2 border border-slate-300 rounded-lg bg-white text-center font-medium"
                           placeholder="เช่น เส้น, ถุง, คิว, แผ่น, กล่อง"
                         />
@@ -919,10 +1650,12 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                         <label className="block text-[11px] font-semibold text-slate-700 mb-0.5">
                           37. สถานที่ส่งมอบ / จุดเท <span className="text-slate-400 font-normal">(หน้างาน)</span>
                         </label>
-                        <input
-                          type="text"
+                        <SmartDatabaseInput
                           value={form.col37 || ''}
-                          onChange={(e) => handleTextChange('col37', e.target.value)}
+                          onChange={(val) => handleTextChange('col37', val)}
+                          options={dbCatalog.locations}
+                          showStatusBadge={true}
+                          fieldLabel="สถานที่ส่งมอบ"
                           className="w-full p-2 border border-slate-300 rounded-lg bg-white"
                           placeholder="เช่น อาคาร 2 หรือ จุดเทฐานราก หรือ คลังสินค้าไซต์"
                         />
@@ -944,7 +1677,199 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                 </div>
               )}
 
-              {/* ==================== 2. TAILORED FORM FOR WEIGHBRIDGE TICKET (ตั๋วชั่งน้ำหนัก) ==================== */}
+              {/* ==================== 2A. TAILORED FORM FOR DESTINATION WEIGHBRIDGE TICKET (ตั๋วชั่งน้ำหนัก ช่อง 18-20) ==================== */}
+              {!showAllCols && isDestWeighbridge && (
+                <div className="space-y-3">
+                  {/* Card 1: Destination Ticket Info & Truck */}
+                  <div className="border border-teal-300 rounded-xl p-3 bg-teal-50/20 space-y-2">
+                    <div className="font-bold text-teal-950 text-xs flex items-center justify-between flex-wrap gap-2">
+                      <span className="flex items-center gap-1.5">
+                        <span className="w-2.5 h-2.5 rounded-full bg-teal-600"></span>
+                        <span>[ตั๋วชั่งน้ำหนัก] ข้อมูลตั๋วชั่งปลายทาง & รถบรรทุก (สำหรับชนบิลเข้า DO)</span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => handleDocTypeSelect('delivery_order')}
+                        className="text-[11px] bg-white hover:bg-sky-50 text-sky-800 border border-sky-300 px-2 py-0.5 rounded-md font-semibold cursor-pointer transition"
+                      >
+                        สลับเป็นใบส่งของ DO (ชั่งต้นทาง ช่อง 13-15) →
+                      </button>
+                    </div>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                      <div>
+                        <label className="block text-[11px] font-bold text-teal-950 mb-0.5">
+                          17. เลขที่ตั๋วชั่งน้ำหนัก <span className="text-rose-500">*</span>
+                        </label>
+                        <input
+                          type="text"
+                          required
+                          value={form.col17 || form.col6 || ''}
+                          onChange={(e) => {
+                            handleTextChange('col17', e.target.value);
+                            handleTextChange('col6', e.target.value);
+                          }}
+                          className="w-full p-2 border border-teal-300 rounded-lg bg-white font-mono font-bold text-teal-900"
+                          placeholder="เลขที่ตั๋วชั่ง"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-semibold text-slate-700 mb-0.5">16. วันที่ชั่งน้ำหนัก</label>
+                        <input
+                          type="date"
+                          value={form.col16 || form.col7 || ''}
+                          onChange={(e) => {
+                            handleTextChange('col16', e.target.value);
+                            handleTextChange('col7', e.target.value);
+                          }}
+                          className="w-full p-2 border border-slate-300 rounded-lg bg-white font-mono"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-bold text-slate-800 mb-0.5">
+                          10. ทะเบียนรถบรรทุก <span className="text-rose-500">*</span>
+                        </label>
+                        <SmartDatabaseInput
+                          required
+                          value={form.col10 || ''}
+                          onChange={(val) => handleTextChange('col10', val)}
+                          options={dbCatalog.licensePlates}
+                          showStatusBadge={true}
+                          fieldLabel="ทะเบียนรถ"
+                          className="w-full p-2 border border-slate-300 rounded-lg bg-white font-mono font-bold text-blue-800"
+                          placeholder="เช่น 70-1234"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-bold text-sky-900 mb-0.5">🔗 อ้างอิงเลข DO ในตั๋ว (เพื่อชนอัตโนมัติ)</label>
+                        <input
+                          type="text"
+                          value={form.referenceDocNo || ''}
+                          onChange={(e) => handleTextChange('referenceDocNo', e.target.value)}
+                          className="w-full p-2 border border-sky-300 rounded-lg bg-white font-mono text-sky-900"
+                          placeholder="เลข DO ในตั๋ว หรือเว้นว่างเพื่อชนด้วยมือ"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-bold text-slate-800 mb-0.5">8. ร้านค้า / แหล่งที่มา</label>
+                        <SmartDatabaseInput
+                          value={form.col8 || ''}
+                          onChange={(val) => handleTextChange('col8', val)}
+                          options={dbCatalog.stores}
+                          isStoreField={true}
+                          showStatusBadge={true}
+                          fieldLabel="ร้านค้า"
+                          className="w-full p-2 border border-slate-300 rounded-lg bg-white font-bold text-slate-900"
+                          placeholder="ชื่อร้านค้า หรือ โรงโม่ต้นทาง"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-bold text-teal-950 mb-0.5">11. ชนิดสินค้า</label>
+                        <SmartDatabaseInput
+                          value={form.col11 || ''}
+                          onChange={(val) => handleTextChange('col11', val)}
+                          options={poAwareItemOptions}
+                          showStatusBadge={true}
+                          fieldLabel="ชนิดสินค้า"
+                          className="w-full p-2 border border-teal-300 rounded-lg bg-white font-bold text-teal-900"
+                          placeholder="เช่น หินคลุก, ทรายหยาบ, ดินถม"
+                        />
+                      </div>
+                      <div className="col-span-2 sm:col-span-3">
+                        <label className="block text-[11px] font-bold text-slate-800 mb-0.5">
+                          2. โครงการ / หน้างาน <span className="text-rose-500">* (ต้องระบุก่อนบันทึก)</span>
+                        </label>
+                        <SmartDatabaseInput
+                          required
+                          value={form.col2 || ''}
+                          onChange={(val) => handleTextChange('col2', val)}
+                          onSelectOption={(opt) => {
+                            handleTextChange('col2', opt.value);
+                            if (!form.col37 && opt.meta?.location) {
+                              handleTextChange('col37', opt.meta.location);
+                            }
+                          }}
+                          options={dbCatalog.projects}
+                          showStatusBadge={true}
+                          fieldLabel="โครงการ"
+                          className={`w-full p-2 border rounded-lg bg-white font-semibold ${
+                            !form.col2?.trim() ? 'border-amber-400 ring-1 ring-amber-300 bg-amber-50/30' : 'border-slate-300'
+                          }`}
+                          placeholder="เลือกหรือพิมพ์ชื่อโครงการ (จำเป็นต้องระบุ)"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Card 2: Zone 4 Destination Scale Weights (Col 18, 19, 20) */}
+                  <div className="border border-teal-400 rounded-xl p-3.5 bg-teal-50/50 space-y-2.5 shadow-2xs">
+                    <div className="flex items-center justify-between flex-wrap gap-2">
+                      <div className="font-bold text-teal-950 text-xs flex items-center gap-1.5">
+                        <Scale className="w-4 h-4 text-teal-600" />
+                        <span>[โซน 4] ส่วนเก็บน้ำหนักตั๋วชั่ง (ช่อง 18, 19, 20)</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleSwapDestWeights}
+                        className="px-2.5 py-1 bg-white hover:bg-teal-50 text-teal-900 border border-teal-300 rounded-lg font-bold text-[11px] cursor-pointer shadow-2xs transition"
+                        title="คลิกเพื่อสลับตัวเลขระหว่างช่อง 18 กับ ช่อง 19"
+                      >
+                        ⇄ สลับค่า 18 ↔ 19
+                      </button>
+                    </div>
+
+                    <div className="grid grid-cols-3 gap-2.5">
+                      <div>
+                        <label className="block text-[11px] font-bold text-slate-800 mb-0.5">
+                          18. หนักเข้า (Gross กก.)
+                        </label>
+                        <input
+                          type="number"
+                          value={form.col18 !== undefined ? form.col18 : ''}
+                          onChange={(e) => handleWeightChange('col18', parseFloat(e.target.value) || 0)}
+                          className="w-full p-2 border border-teal-300 rounded-lg bg-white text-right font-mono font-bold text-slate-900 text-sm"
+                          placeholder="0"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-bold text-slate-800 mb-0.5">
+                          19. เบาออก (Tare กก.)
+                        </label>
+                        <input
+                          type="number"
+                          value={form.col19 !== undefined ? form.col19 : ''}
+                          onChange={(e) => handleWeightChange('col19', parseFloat(e.target.value) || 0)}
+                          className="w-full p-2 border border-teal-300 rounded-lg bg-white text-right font-mono font-bold text-slate-900 text-sm"
+                          placeholder="0"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-bold text-teal-950 mb-0.5">
+                          20. น้ำหนักสุทธิ (Net กก.)
+                        </label>
+                        <input
+                          type="number"
+                          readOnly
+                          value={form.col20 || 0}
+                          className="w-full p-2 border border-teal-500 rounded-lg bg-teal-100 text-right font-mono font-bold text-teal-950 text-sm"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="flex items-center justify-between text-[11px] bg-white p-2 rounded-lg border border-teal-200 text-teal-900">
+                      <span className="flex items-center gap-1 font-medium">
+                        <Info className="w-3.5 h-3.5 text-teal-600" />
+                        <span>เมื่อบันทึกแล้ว ระบบจะนำไปชนกับน้ำหนักต้นทางในใบส่งของ (DO ช่อง 15) เพื่อคำนวณผลต่าง (ช่อง 21)</span>
+                      </span>
+                      <span className="font-mono font-bold">
+                        {((Number(form.col20) || 0) / 1000).toFixed(2)} ตัน
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* ==================== 2B. TAILORED FORM FOR ORIGIN WEIGHBRIDGE TICKET (กรณีใช้แทน DO ช่อง 13-15) ==================== */}
               {!showAllCols && isWeighbridge && (
                 <div className="space-y-3">
                   {/* Card 1: Ticket & Truck */}
@@ -1106,13 +2031,20 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                         />
                       </div>
                       <div>
-                        <label className="block text-[11px] font-semibold text-slate-700 mb-0.5">2. โครงการ / หน้างาน</label>
-                        <input
-                          type="text"
+                        <label className="block text-[11px] font-bold text-slate-800 mb-0.5">
+                          2. โครงการ / หน้างาน <span className="text-rose-500">* (ต้องระบุก่อนบันทึก)</span>
+                        </label>
+                        <SmartDatabaseInput
+                          required
                           value={form.col2 || ''}
-                          onChange={(e) => handleTextChange('col2', e.target.value)}
-                          className="w-full p-2 border border-slate-300 rounded-lg bg-white"
-                          placeholder="โครงการทางหลวง, อาคาร"
+                          onChange={(val) => handleTextChange('col2', val)}
+                          options={dbCatalog.projects}
+                          showStatusBadge={true}
+                          fieldLabel="โครงการ"
+                          className={`w-full p-2 border rounded-lg bg-white font-semibold ${
+                            !form.col2?.trim() ? 'border-amber-400 ring-1 ring-amber-300 bg-amber-50/30' : 'border-slate-300'
+                          }`}
+                          placeholder="เลือกหรือพิมพ์ชื่อโครงการ"
                         />
                       </div>
                     </div>
@@ -1453,23 +2385,45 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                         <label className="block text-[11px] font-bold text-slate-800 mb-0.5">
                           8. ชื่อบริษัทผู้ขาย / ร้านค้า <span className="text-rose-500">*</span>
                         </label>
-                        <input
-                          type="text"
+                        <SmartDatabaseInput
                           required
                           value={form.col8 || ''}
-                          onChange={(e) => handleTextChange('col8', e.target.value)}
+                          onChange={(val) => handleTextChange('col8', val)}
+                          options={dbCatalog.stores}
+                          isStoreField={true}
+                          showStatusBadge={true}
+                          fieldLabel="ร้านค้า"
                           className="w-full p-2 border border-slate-300 rounded-lg bg-white font-bold text-slate-900"
                           placeholder="ชื่อบริษัทผู้ออกใบกำกับภาษี"
                         />
                       </div>
-                      <div className="col-span-2">
-                        <label className="block text-[11px] font-semibold text-slate-700 mb-0.5">9. ชื่อผู้ซื้อ / โครงการ</label>
-                        <input
-                          type="text"
-                          value={form.col9 || form.col2 || ''}
-                          onChange={(e) => handleTextChange('col9', e.target.value)}
+                      <div className="col-span-2 sm:col-span-1">
+                        <label className="block text-[11px] font-bold text-slate-800 mb-0.5">
+                          2. โครงการ / หน้างาน <span className="text-rose-500">* (ต้องระบุ)</span>
+                        </label>
+                        <SmartDatabaseInput
+                          required
+                          value={form.col2 || ''}
+                          onChange={(val) => handleTextChange('col2', val)}
+                          options={dbCatalog.projects}
+                          showStatusBadge={true}
+                          fieldLabel="โครงการ"
+                          className={`w-full p-2 border rounded-lg bg-white font-semibold ${
+                            !form.col2?.trim() ? 'border-amber-400 ring-1 ring-amber-300 bg-amber-50/30' : 'border-slate-300'
+                          }`}
+                          placeholder="เลือกหรือพิมพ์ชื่อโครงการ (จำเป็น)"
+                        />
+                      </div>
+                      <div className="col-span-2 sm:col-span-1">
+                        <label className="block text-[11px] font-semibold text-slate-700 mb-0.5">9. ชื่อผู้ซื้อ / ผู้รับบิล</label>
+                        <SmartDatabaseInput
+                          value={form.col9 || ''}
+                          onChange={(val) => handleTextChange('col9', val)}
+                          options={dbCatalog.buyersAndStaff}
+                          showStatusBadge={false}
+                          fieldLabel="ผู้ซื้อ"
                           className="w-full p-2 border border-slate-300 rounded-lg bg-white"
-                          placeholder="ชื่อบริษัทผู้ซื้อ หรือ โครงการก่อสร้าง"
+                          placeholder="ชื่อบริษัทผู้ซื้อ หรือ ผู้เบิก"
                         />
                       </div>
                     </div>
@@ -1492,11 +2446,13 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                         <label className="block text-[11px] font-bold text-blue-950 mb-0.5">
                           11. รายการสินค้า / บริการ <span className="text-rose-500">*</span>
                         </label>
-                        <input
-                          type="text"
+                        <SmartDatabaseInput
                           required
                           value={form.col11 || ''}
-                          onChange={(e) => handleTextChange('col11', e.target.value)}
+                          onChange={(val) => handleTextChange('col11', val)}
+                          options={poAwareItemOptions}
+                          showStatusBadge={true}
+                          fieldLabel="รายการสินค้า"
                           className="w-full p-2 border border-blue-300 rounded-lg bg-white font-bold text-blue-900"
                           placeholder="รายละเอียดสินค้าหรือบริการตามใบเสร็จ"
                         />
@@ -1513,10 +2469,12 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                       </div>
                       <div>
                         <label className="block text-[11px] font-semibold text-slate-700 mb-0.5">23. หน่วย</label>
-                        <input
-                          type="text"
+                        <SmartDatabaseInput
                           value={form.col23 || ''}
-                          onChange={(e) => handleTextChange('col23', e.target.value)}
+                          onChange={(val) => handleTextChange('col23', val)}
+                          options={dbCatalog.units}
+                          showStatusBadge={false}
+                          fieldLabel="หน่วยนับ"
                           className="w-full p-2 border border-slate-300 rounded-lg bg-white text-center font-medium"
                           placeholder="รายการ, ชิ้น, งาน"
                         />
@@ -1631,13 +2589,20 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                         />
                       </div>
                       <div>
-                        <label className="block text-[11px] font-semibold text-slate-600 mb-0.5">2. โครงการ / หน้างาน</label>
-                        <input
-                          type="text"
+                        <label className="block text-[11px] font-bold text-slate-800 mb-0.5">
+                          2. โครงการ / หน้างาน <span className="text-rose-500">* (ต้องระบุ)</span>
+                        </label>
+                        <SmartDatabaseInput
+                          required
                           value={form.col2 || ''}
-                          onChange={(e) => handleTextChange('col2', e.target.value)}
-                          className="w-full p-2 border border-slate-300 rounded-lg bg-white font-medium"
-                          placeholder="เช่น อาคาร A, โครงการทางหลวง"
+                          onChange={(val) => handleTextChange('col2', val)}
+                          options={dbCatalog.projects}
+                          showStatusBadge={true}
+                          fieldLabel="โครงการ"
+                          className={`w-full p-2 border rounded-lg bg-white font-semibold ${
+                            !form.col2?.trim() ? 'border-amber-400 ring-1 ring-amber-300 bg-amber-50/30' : 'border-slate-300'
+                          }`}
+                          placeholder="เลือกหรือพิมพ์ชื่อโครงการ (จำเป็น)"
                         />
                       </div>
                       <div>
@@ -1661,13 +2626,15 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                         />
                       </div>
                       <div>
-                        <label className="block text-[11px] font-semibold text-slate-600 mb-0.5">5. เลขที่ RR (ใบรับของ)</label>
+                        <label className="block text-[11px] font-semibold text-slate-600 mb-0.5" title="สำหรับระบบรับวางบิลในอนาคต (โซน 5-6) ไม่ใช้ชนบิลโซน 1-4">
+                          5. เลขที่ RR (ระบบรับวางบิลในอนาคต)
+                        </label>
                         <input
                           type="text"
                           value={form.col5 || ''}
                           onChange={(e) => handleTextChange('col5', e.target.value)}
                           className="w-full p-2 border border-slate-300 rounded-lg bg-white font-mono"
-                          placeholder="RR-xxxxx"
+                          placeholder="RR-xxxxx (ระบบรับวางบิล)"
                         />
                       </div>
                       <div>
@@ -1709,29 +2676,36 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                         <label className="block text-[11px] font-bold text-slate-800 mb-0.5">
                           8. ผู้จำหน่าย / ร้านค้า <span className="text-rose-500">*</span>
                         </label>
-                        <input
-                          type="text"
+                        <SmartDatabaseInput
                           required
                           value={form.col8 || ''}
-                          onChange={(e) => handleTextChange('col8', e.target.value)}
+                          onChange={(val) => handleTextChange('col8', val)}
+                          options={dbCatalog.stores}
+                          isStoreField={true}
+                          showStatusBadge={true}
+                          fieldLabel="ร้านค้า"
                           className="w-full p-2 border border-slate-300 rounded-lg bg-white font-bold text-slate-900"
                         />
                       </div>
                       <div>
                         <label className="block text-[11px] font-semibold text-slate-600 mb-0.5">9. ผู้รับเหมา / ผู้ซื้อ</label>
-                        <input
-                          type="text"
+                        <SmartDatabaseInput
                           value={form.col9 || ''}
-                          onChange={(e) => handleTextChange('col9', e.target.value)}
+                          onChange={(val) => handleTextChange('col9', val)}
+                          options={dbCatalog.buyersAndStaff}
+                          showStatusBadge={false}
+                          fieldLabel="ผู้รับเหมา/ผู้ซื้อ"
                           className="w-full p-2 border border-slate-300 rounded-lg bg-white"
                         />
                       </div>
                       <div>
                         <label className="block text-[11px] font-semibold text-slate-600 mb-0.5">10. ทะเบียนรถขนส่ง</label>
-                        <input
-                          type="text"
+                        <SmartDatabaseInput
                           value={form.col10 || ''}
-                          onChange={(e) => handleTextChange('col10', e.target.value)}
+                          onChange={(val) => handleTextChange('col10', val)}
+                          options={dbCatalog.licensePlates}
+                          showStatusBadge={true}
+                          fieldLabel="ทะเบียนรถ"
                           className="w-full p-2 border border-slate-300 rounded-lg bg-white font-mono font-semibold"
                         />
                       </div>
@@ -1739,20 +2713,24 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                         <label className="block text-[11px] font-bold text-blue-950 mb-0.5">
                           11. รายการสินค้า <span className="text-rose-500">*</span>
                         </label>
-                        <input
-                          type="text"
+                        <SmartDatabaseInput
                           required
                           value={form.col11 || ''}
-                          onChange={(e) => handleTextChange('col11', e.target.value)}
+                          onChange={(val) => handleTextChange('col11', val)}
+                          options={poAwareItemOptions}
+                          showStatusBadge={true}
+                          fieldLabel="รายการสินค้า"
                           className="w-full p-2 border border-blue-300 rounded-lg bg-white font-bold text-blue-900"
                         />
                       </div>
                       <div>
                         <label className="block text-[11px] font-semibold text-slate-600 mb-0.5">12. สเปก / Code / Slump</label>
-                        <input
-                          type="text"
+                        <SmartDatabaseInput
                           value={form.col12 || ''}
-                          onChange={(e) => handleTextChange('col12', e.target.value)}
+                          onChange={(val) => handleTextChange('col12', val)}
+                          options={dbCatalog.specs}
+                          showStatusBadge={false}
+                          fieldLabel="สเปก"
                           className="w-full p-2 border border-slate-300 rounded-lg bg-white font-mono"
                         />
                       </div>
@@ -2033,10 +3011,12 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                         <label className="block text-[10px] font-semibold text-slate-600 mb-0.5">
                           37. สถานที่ส่งมอบ / จุดเท / กม.
                         </label>
-                        <input
-                          type="text"
+                        <SmartDatabaseInput
                           value={form.col37 || ''}
-                          onChange={(e) => handleTextChange('col37', e.target.value)}
+                          onChange={(val) => handleTextChange('col37', val)}
+                          options={dbCatalog.locations}
+                          showStatusBadge={true}
+                          fieldLabel="สถานที่ส่งมอบ"
                           className="w-full p-2 border border-slate-300 rounded-lg bg-white"
                           placeholder="เช่น หน้างาน กม. 42+500 หรือ คลังสินค้า C"
                         />
@@ -2057,7 +3037,7 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
               )}
 
               {/* Bottom Submit Action */}
-              <div className="pt-3 border-t border-slate-200 flex items-center justify-between">
+              <div className="pt-3 border-t border-slate-200 flex flex-wrap items-center justify-between gap-2">
                 <button
                   type="button"
                   onClick={onClose}
@@ -2066,13 +3046,44 @@ export const VerifyModal: React.FC<VerifyModalProps> = ({
                   ยกเลิก
                 </button>
 
-                <button
-                  type="submit"
-                  className="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold transition flex items-center gap-2 shadow-md shadow-emerald-200 cursor-pointer active:scale-95 text-xs md:text-sm"
-                >
-                  <Save className="w-4 h-4" />
-                  <span>บันทึกข้อมูลเอกสาร</span>
-                </button>
+                <div className="flex items-center gap-2 flex-wrap">
+                  {blockingDuplicates.length > 0 ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={onClose}
+                        className="px-4 py-2.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl font-bold transition flex items-center gap-1.5 shadow-sm cursor-pointer text-xs"
+                      >
+                        <X className="w-4 h-4" />
+                        <span>ยกเลิกการนำเข้าบิลซ้ำ (ปิดหน้าต่าง)</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled
+                        className="px-5 py-2.5 bg-slate-200 text-slate-500 border border-slate-300 rounded-xl font-bold flex items-center gap-2 cursor-not-allowed text-xs"
+                      >
+                        <AlertTriangle className="w-4 h-4 text-rose-600" />
+                        <span>🚫 บล็อกการบันทึก: บิลซ้ำกับ {blockingDuplicates[0].matchedOrder.col1}</span>
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      {!form.col2?.trim() && (
+                        <span className="text-[11px] font-bold text-amber-900 bg-amber-100 border border-amber-300 px-3 py-1.5 rounded-xl flex items-center gap-1.5">
+                          <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                          <span>ต้องระบุ "2. ชื่อโครงการ (ช่อง 2)" ก่อนกดยืนยันบันทึก</span>
+                        </span>
+                      )}
+                      <button
+                        type="submit"
+                        className="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold transition flex items-center gap-2 shadow-md shadow-emerald-200 cursor-pointer active:scale-95 text-xs md:text-sm"
+                      >
+                        <Save className="w-4 h-4" />
+                        <span>ยืนยันบันทึกข้อมูลเอกสาร</span>
+                      </button>
+                    </>
+                  )}
+                </div>
               </div>
 
             </form>

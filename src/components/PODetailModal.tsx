@@ -20,13 +20,15 @@ import {
   Unlink,
   Image as ImageIcon
 } from 'lucide-react';
-import { PurchaseOrder, OrderRecord, StoreMerchant } from '../types';
+import { PurchaseOrder, OrderRecord, StoreMerchant, SystemSettings } from '../types';
 import { reconcilePO, findCandidateUnlinkedOrders, normalizeDocNumber } from '../utils/poReconciliation';
+import { DEFAULT_SYSTEM_SETTINGS, DEFAULT_COMPANY_LOGO_URL } from '../utils/systemConfig';
 
 interface PODetailModalProps {
   isOpen: boolean;
   po: PurchaseOrder | null;
   orders: OrderRecord[];
+  systemSettings?: SystemSettings;
   onClose: () => void;
   onEditPO: (po: PurchaseOrder) => void;
   onInspectOrder: (order: OrderRecord) => void;
@@ -39,6 +41,7 @@ export const PODetailModal: React.FC<PODetailModalProps> = ({
   isOpen,
   po,
   orders,
+  systemSettings = DEFAULT_SYSTEM_SETTINGS,
   onClose,
   onEditPO,
   onInspectOrder,
@@ -154,19 +157,44 @@ export const PODetailModal: React.FC<PODetailModalProps> = ({
             <div className="bg-white border border-slate-300 rounded-xl p-8 shadow-sm space-y-6 print:border-none print:shadow-none print:p-0">
               
               {/* Document Header */}
-              <div className="flex flex-wrap items-start justify-between border-b border-slate-200 pb-5 gap-4">
-                <div>
-                  <h1 className="text-xl font-black text-slate-900 tracking-tight">
-                    ข้อมูลใบสั่งซื้อสินค้า (PURCHASE ORDER)
-                  </h1>
-                  <p className="text-xs text-slate-500 mt-1">
-                    คลังเอกสารและระบบชนบิลสำหรับฝ่ายจัดซื้อ
-                  </p>
+              <div className="flex flex-wrap items-start justify-between border-b-2 border-slate-900 pb-5 gap-4">
+                <div className="flex items-start gap-4">
+                  <div className="w-16 h-16 rounded-xl border border-slate-200 bg-white p-1.5 flex items-center justify-center shrink-0 overflow-hidden shadow-2xs">
+                    <img
+                      src={systemSettings.companyLogoUrl || DEFAULT_COMPANY_LOGO_URL}
+                      alt={systemSettings.companyName}
+                      className="w-full h-full object-contain"
+                      onError={e => {
+                        (e.currentTarget as HTMLImageElement).style.display = 'none';
+                      }}
+                    />
+                  </div>
+                  <div className="space-y-0.5">
+                    <h2 className="text-base font-extrabold text-slate-900 tracking-tight">
+                      {systemSettings.companyName}
+                    </h2>
+                    <p className="text-xs text-slate-700">
+                      {systemSettings.companyAddress.startsWith('ที่อยู่')
+                        ? systemSettings.companyAddress
+                        : `ที่อยู่ ${systemSettings.companyAddress}`}
+                    </p>
+                    <p className="text-xs text-slate-700 font-mono">
+                      เลขประจำตัวผู้เสียภาษี {systemSettings.companyTaxId || '-'} &nbsp; โทร.{systemSettings.companyPhone || '-'}
+                    </p>
+                    {(systemSettings.companyEmail || 'brtc2024@gmail.com') && (
+                      <p className="text-xs text-slate-700 font-mono">
+                        E-Mail.{systemSettings.companyEmail || 'brtc2024@gmail.com'}
+                      </p>
+                    )}
+                  </div>
                 </div>
                 <div className="text-right font-mono">
+                  <div className="inline-block px-3 py-1 rounded-lg bg-slate-900 text-white text-xs font-bold mb-1 font-sans">
+                    ใบสั่งซื้อสินค้า (PURCHASE ORDER)
+                  </div>
                   <div className="text-xs text-slate-500">เลขที่ / PO NO.</div>
                   <div className="text-base font-bold text-blue-900">{po.poNumber}</div>
-                  <div className="text-xs text-slate-500 mt-1">
+                  <div className="text-xs text-slate-500 mt-0.5">
                     วันที่: <span className="text-slate-900 font-medium">{po.orderDate}</span>
                   </div>
                   {po.deliveryDueDate && (

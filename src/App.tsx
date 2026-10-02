@@ -3,55 +3,234 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
-import { Header } from './components/Header';
+import React, { useState, useEffect, useMemo } from 'react';
+import { Header, SidebarNav, MainTabType } from './components/Header';
 import { StatSummaryCards } from './components/StatSummaryCards';
 import { TableView39Cols } from './components/TableView39Cols';
 import { POManagementView } from './components/POManagementView';
 import { PODetailModal } from './components/PODetailModal';
 import { POEditModal } from './components/POEditModal';
-import { POScanModal } from './components/POScanModal';
-import { StoresManagementView } from './components/StoresManagementView';
+import { StoresManagementView, ProjectsManagementView } from './components/StoresManagementView';
 import { AnalyticsView } from './components/AnalyticsView';
+import { LineInboxView } from './components/LineInboxView';
+import { ReportsExportView } from './components/ReportsExportView';
+import { UsersRolesView } from './components/UsersRolesView';
+import { SystemSettingsView } from './components/SystemSettingsView';
+import { LoginModal } from './components/LoginModal';
 import { ScanModal } from './components/ScanModal';
 import { VerifyModal } from './components/VerifyModal';
 import { StoreDetailModal } from './components/StoreDetailModal';
 import { StoreEditModal } from './components/StoreEditModal';
-import { OrderRecord, StoreMerchant, PurchaseOrder } from './types';
+import {
+  OrderRecord,
+  StoreMerchant,
+  PurchaseOrder,
+  ProjectRecord,
+  LineBillInboxItem,
+  AppUser,
+  UserRole,
+  RolePermissions,
+  SystemSettings,
+  SystemBackupPayload
+} from './types';
 import { exportAllDataToExcel } from './utils/excelExport';
+import { isDocNumberMatch, extractDocReferences, checkDuplicateOrder, checkDuplicatePO } from './utils/poReconciliation';
+import { convertOrderDraftToPODraft } from './utils/lineBillRemapper';
+import { safeSaveToLocalStorage } from './utils/storageEngine';
+import {
+  STORAGE_USERS_KEY,
+  STORAGE_ROLES_KEY,
+  STORAGE_SETTINGS_KEY,
+  STORAGE_CURRENT_USER_KEY,
+  STORAGE_DISMISSED_NOTIFS_KEY,
+  SYSTEM_MASTER_ADMIN,
+  DEFAULT_USERS,
+  DEFAULT_ROLE_PERMISSIONS,
+  DEFAULT_SYSTEM_SETTINGS,
+  normalizeSystemSettings,
+  ensureSystemMasterAdmin,
+  computeSystemNotifications
+} from './utils/systemConfig';
 import { CheckCircle2 } from 'lucide-react';
 
 const STORAGE_ORDERS_KEY = 'autostore_real_orders_v2';
 const STORAGE_STORES_KEY = 'autostore_real_stores_v2';
 const STORAGE_POS_KEY = 'autostore_real_pos_v2';
+const STORAGE_PROJECTS_KEY = 'autostore_real_projects_v2';
+const STORAGE_LINE_INBOX_KEY = 'autostore_line_inbox_v1';
 
 // Helper to recalculate store financials strictly from actual order records (Single Source of Truth)
 const syncStoreFinancials = (storesList: StoreMerchant[], ordersList: OrderRecord[]): StoreMerchant[] => {
   return storesList.map(store => {
     const storeOrders = ordersList.filter(
-      o => o.storeId === store.id || (o.col8 && o.col8.trim().toLowerCase() === store.name.trim().toLowerCase())
+      o => (o.storeId === store.id || (o.col8 && o.col8.trim().toLowerCase() === store.name.trim().toLowerCase())) &&
+           o.docType !== 'dest_weighbridge'
+    );
+    const hasPricedDeliveries = storeOrders.some(
+      o => o.docType !== 'tax_invoice' && (Number(o.col29) > 0 || Number(o.col25) > 0)
     );
     let totalPurchases = 0;
     let totalPaid = 0;
     let totalDebt = 0;
+    let validOrderCount = 0;
     let lastDate = store.lastOrderDate || '';
     storeOrders.forEach(o => {
-      if (o.docType === 'dest_weighbridge') return;
-      totalPurchases += Number(o.col29) || 0;
-      totalPaid += Number(o.col35) || 0;
-      totalDebt += Number(o.col36) || 0;
+      // Skip tax invoices that have already been matched/merged into a DO's Zone 5-6
+      if (o.docType === 'tax_invoice' && o.linkedViaDocNo) return;
+      // Prevent double-counting purchase value if store already has priced DO/Weighbridge records,
+      // while still counting standalone tax invoices or Zone 6 payments recorded on unmatched tax invoices
+      if (o.docType === 'tax_invoice' && hasPricedDeliveries) {
+        totalPaid += Number(o.col35) || 0;
+        totalDebt += Number(o.col36) || 0;
+      } else {
+        validOrderCount++;
+        totalPurchases += Number(o.col29) || 0;
+        totalPaid += Number(o.col35) || 0;
+        totalDebt += Number(o.col36) || 0;
+      }
       if (o.col7 && o.col7 > lastDate) lastDate = o.col7;
     });
 
     return {
       ...store,
-      totalOrders: storeOrders.length,
+      totalOrders: validOrderCount,
       totalPurchases,
       totalPaid,
       totalDebt,
       lastOrderDate: lastDate || store.lastOrderDate
     };
   });
+};
+
+// Helper to ensure Gross >= Tare for Zone 3 (col13, col14, col15) and Zone 4 (col18, col19, col20)
+// and recover any missing Zone 4 fields on dest_weighbridge records from col13-15, rawAiSnapshot, or col22
+const normalizeOrderWeights = (ord: OrderRecord): OrderRecord => {
+  const next = { ...ord };
+  const snap: Record<string, any> = (next.rawAiSnapshot as Record<string, any>) || {};
+
+  if (next.docType === 'dest_weighbridge') {
+    if (!next.col16) {
+      next.col16 = next.col7 || snap.rawDate || snap.col16 || snap.col7 || '';
+    }
+    if (!next.col17) {
+      next.col17 = next.col6 || snap.rawDocNo || snap.col17 || snap.col6 || next.col1 || '';
+    }
+    if (!Number(next.col18) && !Number(next.col20)) {
+      const recoveredGross =
+        Number(next.col13) ||
+        Number(snap.rawGrossWeightKg) ||
+        Number(snap.col18) ||
+        Number(snap.col13) ||
+        0;
+      const recoveredTare =
+        Number(next.col14) ||
+        Number(snap.rawTareWeightKg) ||
+        Number(snap.col19) ||
+        Number(snap.col14) ||
+        0;
+      let recoveredNet =
+        Number(next.col15) ||
+        Number(snap.rawNetWeightKg) ||
+        Number(snap.col20) ||
+        Number(snap.col15) ||
+        0;
+      if (!recoveredNet && Number(next.col22) > 0 && (next.col23 || '').includes('ตัน')) {
+        recoveredNet = Math.round(Number(next.col22) * 1000);
+      }
+      next.col18 = recoveredGross;
+      next.col19 = recoveredTare;
+      next.col20 = recoveredNet;
+      next.col13 = 0;
+      next.col14 = 0;
+      next.col15 = 0;
+    }
+  }
+
+  const c13 = Number(next.col13) || 0;
+  const c14 = Number(next.col14) || 0;
+  if (c13 > 0 && c14 > 0 && c13 < c14) {
+    next.col13 = c14;
+    next.col14 = c13;
+    next.col15 = c14 - c13;
+  } else if (c13 > 0 && c14 > 0 && !next.col15) {
+    next.col15 = c13 - c14;
+  }
+
+  const c18 = Number(next.col18) || 0;
+  const c19 = Number(next.col19) || 0;
+  if (c18 > 0 && c19 > 0 && c18 < c19) {
+    next.col18 = c19;
+    next.col19 = c18;
+    next.col20 = c19 - c18;
+  } else if (c18 > 0 && c19 > 0 && !next.col20) {
+    next.col20 = c18 - c19;
+  }
+
+  if (Number(next.col15) > 0 && Number(next.col20) > 0) {
+    next.col21 = Number(next.col15) - Number(next.col20);
+  }
+  return next;
+};
+
+// Self-healing reconciliation across DOs and Destination Weighbridge tickets (Zone 4)
+// Ensures that whenever a DO has a linked Zone 4 ticket (or vice versa), Zone 4 columns (16-21) on the DO are always populated
+const reconcileAndHealOrders = (ordersList: OrderRecord[]): OrderRecord[] => {
+  const list = ordersList.map(normalizeOrderWeights);
+
+  for (let i = 0; i < list.length; i++) {
+    const ticket = list[i];
+    if (ticket.docType !== 'dest_weighbridge') continue;
+
+    const ticketNo = ticket.col17 || ticket.col6 || ticket.col1;
+    const textRefs = extractDocReferences(ticket.col38);
+    const refCandidates = [ticket.referenceDocNo, ...textRefs.doNumbers].filter(Boolean) as string[];
+
+    // Find linked DO (matched via matchedDestTicketId, linkedViaDocNo, col17, or autoActionFlags/col38)
+    const doIdx = list.findIndex(ord => {
+      if (ord.id === ticket.id || ord.docType === 'dest_weighbridge' || ord.docType === 'tax_invoice') return false;
+      if (ord.matchedDestTicketId && ord.matchedDestTicketId === ticket.id) return true;
+      if (ticket.linkedViaDocNo && (isDocNumberMatch(ord.col6, ticket.linkedViaDocNo) || isDocNumberMatch(ord.col1, ticket.linkedViaDocNo))) return true;
+      if (ord.col17 && ticketNo && isDocNumberMatch(ord.col17, ticketNo)) return true;
+      if (ticketNo && ((ord.col38 || '').includes(ticketNo) || (ord.autoActionFlags || []).some(f => f.includes(ticketNo)))) return true;
+      if (!ticket.linkedViaDocNo && !ticket.autoFlagsVerified && ord.col6 && refCandidates.some(ref => isDocNumberMatch(ord.col6, ref))) return true;
+      return false;
+    });
+
+    if (doIdx >= 0) {
+      const targetDO = list[doIdx];
+      const grossD = Number(targetDO.col18) || Number(ticket.col18) || 0;
+      const tareD = Number(targetDO.col19) || Number(ticket.col19) || 0;
+      const netD =
+        Number(targetDO.col20) ||
+        Number(ticket.col20) ||
+        (grossD > 0 && tareD > 0 ? Math.abs(grossD - tareD) : 0);
+      const netO = Number(targetDO.col15) || 0;
+      const diff = netO > 0 && netD > 0 ? netO - netD : Number(targetDO.col21) || 0;
+      const destDate = targetDO.col16 || ticket.col16 || ticket.col7 || targetDO.col7 || '';
+
+      list[doIdx] = {
+        ...targetDO,
+        col16: destDate,
+        col17: targetDO.col17 || ticketNo,
+        col18: grossD,
+        col19: tareD,
+        col20: netD,
+        col21: diff,
+        matchedDestTicketId: targetDO.matchedDestTicketId || ticket.id,
+        destMatchStatus: targetDO.destMatchStatus || ticket.destMatchStatus || 'auto_flagged'
+      };
+
+      if (!ticket.linkedViaDocNo) {
+        list[i] = {
+          ...ticket,
+          linkedViaDocNo: targetDO.col6 || targetDO.col1,
+          destMatchStatus: ticket.destMatchStatus || targetDO.destMatchStatus || 'auto_flagged'
+        };
+      }
+    }
+  }
+
+  return list;
 };
 
 export default function App() {
@@ -61,7 +240,8 @@ export default function App() {
       localStorage.removeItem('autostore_orders_v1');
       localStorage.removeItem('logistics_table_39cols_data');
       const saved = localStorage.getItem(STORAGE_ORDERS_KEY);
-      return saved ? JSON.parse(saved) : [];
+      const parsed: OrderRecord[] = saved ? JSON.parse(saved) : [];
+      return reconcileAndHealOrders(parsed);
     } catch {
       return [];
     }
@@ -86,9 +266,130 @@ export default function App() {
     }
   });
 
-  // Navigation tab: 'orders' (ตั๋วชั่ง&บิล) | 'pos' (ใบสั่งซื้อ) | 'stores' (ร้านค้า) | 'analytics' (วิเคราะห์)
-  const [activeTab, setActiveTab] = useState<'orders' | 'pos' | 'stores' | 'analytics'>('orders');
+  const [projects, setProjects] = useState<ProjectRecord[]>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_PROJECTS_KEY);
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const [lineInbox, setLineInbox] = useState<LineBillInboxItem[]>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_LINE_INBOX_KEY);
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  // Users, Role Permissions & System Settings
+  const [users, setUsers] = useState<AppUser[]>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_USERS_KEY);
+      const parsed: AppUser[] = saved ? JSON.parse(saved) : [];
+      return ensureSystemMasterAdmin(parsed);
+    } catch {
+      return DEFAULT_USERS;
+    }
+  });
+
+  const [rolePermissions, setRolePermissions] = useState<Record<UserRole, RolePermissions>>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_ROLES_KEY);
+      if (!saved) return DEFAULT_ROLE_PERMISSIONS;
+      const parsed = JSON.parse(saved);
+      return {
+        admin: { ...DEFAULT_ROLE_PERMISSIONS.admin, ...(parsed.admin || {}) },
+        manager: { ...DEFAULT_ROLE_PERMISSIONS.manager, ...(parsed.manager || {}) },
+        user: { ...DEFAULT_ROLE_PERMISSIONS.user, ...(parsed.user || {}) }
+      };
+    } catch {
+      return DEFAULT_ROLE_PERMISSIONS;
+    }
+  });
+
+  const [systemSettings, setSystemSettings] = useState<SystemSettings>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_SETTINGS_KEY);
+      if (!saved) return DEFAULT_SYSTEM_SETTINGS;
+      return normalizeSystemSettings(JSON.parse(saved));
+    } catch {
+      return DEFAULT_SYSTEM_SETTINGS;
+    }
+  });
+
+  const [currentUserId, setCurrentUserId] = useState<string>(() => {
+    try {
+      const savedId = localStorage.getItem(STORAGE_CURRENT_USER_KEY);
+      if (!savedId || savedId === 'USR-ADMIN-01' || savedId === 'USR-MGR-01' || savedId === 'USR-STAFF-01') {
+        return SYSTEM_MASTER_ADMIN.id;
+      }
+      return savedId;
+    } catch {
+      return SYSTEM_MASTER_ADMIN.id;
+    }
+  });
+
+  const [isLoginModalOpen, setIsLoginModalOpen] = useState<boolean>(() => {
+    try {
+      const savedSettings = localStorage.getItem(STORAGE_SETTINGS_KEY);
+      if (savedSettings) {
+        const parsed = JSON.parse(savedSettings);
+        return Boolean(parsed.requireLoginOnStart);
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  });
+
+  const [dismissedNotifIds, setDismissedNotifIds] = useState<string[]>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_DISMISSED_NOTIFS_KEY);
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  // Active User & Current Role Permissions
+  const currentUser = useMemo(() => {
+    return (
+      users.find(u => u.id === currentUserId && u.status === 'active') ||
+      users.find(u => u.status === 'active') ||
+      DEFAULT_USERS[0]
+    );
+  }, [users, currentUserId]);
+
+  const currentPermissions = useMemo(() => {
+    return rolePermissions[currentUser.role] || DEFAULT_ROLE_PERMISSIONS.admin;
+  }, [rolePermissions, currentUser.role]);
+
+  // Computed Real-Time System Notifications
+  const notifications = useMemo(() => {
+    return computeSystemNotifications(orders, pos, lineInbox, systemSettings);
+  }, [orders, pos, lineInbox, systemSettings]);
+
+  // Navigation tab & Left Sidebar state
+  const [activeTab, setActiveTab] = useState<MainTabType>('orders');
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  const [triggerCreateProjectCounter, setTriggerCreateProjectCounter] = useState(0);
   const [tableExternalFilter, setTableExternalFilter] = useState<string | null>(null);
+
+  // Ensure activeTab is always allowed for currentUser's role
+  useEffect(() => {
+    if (
+      currentPermissions &&
+      Array.isArray(currentPermissions.allowedTabs) &&
+      currentPermissions.allowedTabs.length > 0 &&
+      !currentPermissions.allowedTabs.includes(activeTab)
+    ) {
+      setActiveTab((currentPermissions.allowedTabs[0] as MainTabType) || 'orders');
+    }
+  }, [currentPermissions, activeTab]);
 
   // Bill Scan & Verify Modals
   const [isScanOpen, setIsScanOpen] = useState(false);
@@ -102,7 +403,6 @@ export default function App() {
   const [isPOEditOpen, setIsPOEditOpen] = useState(false);
   const [editingPO, setEditingPO] = useState<PurchaseOrder | null>(null);
   const [initialStoreNameForPO, setInitialStoreNameForPO] = useState<string | undefined>(undefined);
-  const [isPOScanOpen, setIsPOScanOpen] = useState(false);
 
   // Store Detail & Edit Modals
   const [selectedStoreForDetail, setSelectedStoreForDetail] = useState<StoreMerchant | null>(null);
@@ -112,30 +412,88 @@ export default function App() {
   // Toast Notification
   const [toast, setToast] = useState<{ message: string; type?: 'success' | 'info' } | null>(null);
 
-  // Sync to localStorage
+  // Sync to localStorage (with automatic 5MB quota protection so refreshing never loses bill records)
   useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_ORDERS_KEY, JSON.stringify(orders));
-    } catch (e) {
-      console.warn('Failed to save orders to localStorage', e);
-    }
+    safeSaveToLocalStorage(STORAGE_ORDERS_KEY, orders);
   }, [orders]);
 
   useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_STORES_KEY, JSON.stringify(stores));
-    } catch (e) {
-      console.warn('Failed to save stores to localStorage', e);
-    }
+    safeSaveToLocalStorage(STORAGE_STORES_KEY, stores);
   }, [stores]);
 
   useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_POS_KEY, JSON.stringify(pos));
-    } catch (e) {
-      console.warn('Failed to save POs to localStorage', e);
-    }
+    safeSaveToLocalStorage(STORAGE_POS_KEY, pos);
   }, [pos]);
+
+  useEffect(() => {
+    safeSaveToLocalStorage(STORAGE_PROJECTS_KEY, projects);
+  }, [projects]);
+
+  useEffect(() => {
+    safeSaveToLocalStorage(STORAGE_LINE_INBOX_KEY, lineInbox);
+  }, [lineInbox]);
+
+  useEffect(() => {
+    safeSaveToLocalStorage(STORAGE_USERS_KEY, users);
+  }, [users]);
+
+  useEffect(() => {
+    safeSaveToLocalStorage(STORAGE_ROLES_KEY, rolePermissions);
+  }, [rolePermissions]);
+
+  useEffect(() => {
+    safeSaveToLocalStorage(STORAGE_SETTINGS_KEY, systemSettings);
+  }, [systemSettings]);
+
+  useEffect(() => {
+    safeSaveToLocalStorage(STORAGE_CURRENT_USER_KEY, currentUserId);
+  }, [currentUserId]);
+
+  useEffect(() => {
+    safeSaveToLocalStorage(STORAGE_DISMISSED_NOTIFS_KEY, dismissedNotifIds);
+  }, [dismissedNotifIds]);
+
+  // Sync incoming bills from real LINE OA Webhook queue into browser localStorage
+  const syncWebhookQueueToLocal = React.useCallback(async () => {
+    try {
+      const resp = await fetch('/api/line/inbox');
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const incoming: LineBillInboxItem[] = Array.isArray(data?.items) ? data.items : [];
+      if (incoming.length === 0) return;
+
+      const syncedIds: string[] = [];
+      setLineInbox(prev => {
+        const existingIds = new Set(prev.map(i => i.id));
+        const newOnes = incoming.filter(item => {
+          if (item.status === 'queued') return false; // wait until AI finishes or falls back
+          if (!existingIds.has(item.id)) {
+            syncedIds.push(item.id);
+            return true;
+          }
+          syncedIds.push(item.id);
+          return false;
+        });
+        return newOnes.length > 0 ? [...newOnes, ...prev] : prev;
+      });
+
+      if (syncedIds.length > 0) {
+        await fetch('/api/line/inbox/ack', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids: syncedIds })
+        });
+      }
+    } catch {
+      // ignore background poll error
+    }
+  }, []);
+
+  useEffect(() => {
+    syncWebhookQueueToLocal();
+    const timer = setInterval(syncWebhookQueueToLocal, 8000);
+    return () => clearInterval(timer);
+  }, [syncWebhookQueueToLocal]);
 
   const showToast = (message: string, type: 'success' | 'info' = 'success') => {
     setToast({ message, type });
@@ -144,18 +502,127 @@ export default function App() {
     }, 3200);
   };
 
+  // User Auth & Management Handlers
+  const handleLoginSuccess = (loggedInUser: AppUser) => {
+    const nowIso = new Date().toISOString();
+    setCurrentUserId(loggedInUser.id);
+    setUsers(prev =>
+      prev.map(u => (u.id === loggedInUser.id ? { ...u, lastLoginAt: nowIso } : u))
+    );
+    setIsLoginModalOpen(false);
+    showToast(`เข้าใช้งานในชื่อ "${loggedInUser.fullName}" (${rolePermissions[loggedInUser.role]?.label || loggedInUser.role})`);
+  };
+
+  const handleSaveUser = (userToSave: AppUser, isNew: boolean) => {
+    setUsers(prev => {
+      if (isNew) return [...prev, userToSave];
+      return prev.map(u => (u.id === userToSave.id ? userToSave : u));
+    });
+    showToast(
+      isNew
+        ? `เพิ่มผู้ใช้งาน "${userToSave.fullName}" เรียบร้อยแล้ว`
+        : `อัปเดตข้อมูลผู้ใช้ "${userToSave.fullName}" เรียบร้อยแล้ว`
+    );
+  };
+
+  const handleToggleUserStatus = (userId: string) => {
+    const target = users.find(u => u.id === userId);
+    if (!target) return;
+    if (target.isSystemMaster || target.id === SYSTEM_MASTER_ADMIN.id) {
+      showToast('บัญชีหลักมาสเตอร์ (Admin) ติดกับระบบถาวร ไม่สามารถระงับการใช้งานได้', 'info');
+      return;
+    }
+
+    if (target.status === 'active') {
+      const activeAdmins = users.filter(u => u.role === 'admin' && u.status === 'active');
+      if (target.role === 'admin' && activeAdmins.length <= 1) {
+        showToast('ไม่สามารถระงับผู้ดูแลระบบ (Admin) คนสุดท้ายที่เปิดใช้งานอยู่ได้', 'info');
+        return;
+      }
+    }
+
+    const nextStatus = target.status === 'active' ? 'suspended' : 'active';
+    setUsers(prev =>
+      prev.map(u => (u.id === userId ? { ...u, status: nextStatus } : u))
+    );
+    showToast(
+      nextStatus === 'suspended'
+        ? `ระงับการใช้งานบัญชี "${target.fullName}" ชั่วคราวแล้ว`
+        : `เปิดใช้งานบัญชี "${target.fullName}" ตามปกติแล้ว`
+    );
+  };
+
+  // Restore Backup Handler (Merge or Overwrite)
+  const handleRestoreBackup = (payload: SystemBackupPayload, mode: 'merge' | 'overwrite') => {
+    const d = payload.data;
+    if (!d) return;
+
+    if (mode === 'overwrite') {
+      const nextOrders = (d.orders || []).map(normalizeOrderWeights);
+      const nextStores = syncStoreFinancials(d.stores || [], nextOrders);
+      setOrders(nextOrders);
+      setPos(d.pos || []);
+      setStores(nextStores);
+      setProjects(d.projects || []);
+      setLineInbox(d.lineInbox || []);
+      setUsers(ensureSystemMasterAdmin(d.users || []));
+      if (d.rolePermissions) setRolePermissions(d.rolePermissions);
+      if (d.systemSettings) setSystemSettings(d.systemSettings);
+      showToast(`กู้คืนข้อมูลแบบทับทั้งหมดสำเร็จ! (บิล ${nextOrders.length} ใบ • PO ${(d.pos || []).length} ใบ)`);
+    } else {
+      // Merge mode: append records whose ID does not exist yet
+      setOrders(prevOrders => {
+        const existingIds = new Set(prevOrders.map(o => o.id));
+        const incoming = (d.orders || []).filter(o => !existingIds.has(o.id)).map(normalizeOrderWeights);
+        const mergedOrders = [...incoming, ...prevOrders];
+
+        setStores(prevStores => {
+          const storeIds = new Set(prevStores.map(s => s.id));
+          const storeNames = new Set(prevStores.map(s => s.name.trim().toLowerCase()));
+          const incomingStores = (d.stores || []).filter(
+            s => !storeIds.has(s.id) && !storeNames.has(s.name.trim().toLowerCase())
+          );
+          return syncStoreFinancials([...incomingStores, ...prevStores], mergedOrders);
+        });
+
+        return mergedOrders;
+      });
+
+      setPos(prevPos => {
+        const existingIds = new Set(prevPos.map(p => p.id));
+        const incoming = (d.pos || []).filter(p => !existingIds.has(p.id));
+        return [...incoming, ...prevPos];
+      });
+
+      setProjects(prevProjects => {
+        const existingNames = new Set(prevProjects.map(p => p.name.trim().toLowerCase()));
+        const incoming = (d.projects || []).filter(p => !existingNames.has(p.name.trim().toLowerCase()));
+        return [...incoming, ...prevProjects];
+      });
+
+      setLineInbox(prevInbox => {
+        const existingIds = new Set(prevInbox.map(i => i.id));
+        const incoming = (d.lineInbox || []).filter(i => !existingIds.has(i.id));
+        return [...incoming, ...prevInbox];
+      });
+
+      showToast('ผสานข้อมูลจากไฟล์สำรอง (Merge) เข้าสู่ระบบเรียบร้อยแล้ว!');
+    }
+  };
+
   // AI Scan completion handler
   const handleScanComplete = (
     data: Partial<OrderRecord>,
     imageBase64: string,
     storeSuggestion?: Partial<StoreMerchant>
   ) => {
+    const poPrefix = systemSettings.poPrefix || `PO-${new Date().getFullYear()}-`;
     // If Gemini identified this as a Purchase Order (PO):
     if (data.docType === 'purchase_order') {
       const today = new Date().toISOString().split('T')[0];
       const newPO: PurchaseOrder = {
         id: `po-${Date.now()}`,
-        poNumber: data.col4 || data.col6 || `PO-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`,
+        poNumber: data.col4 || data.col6 || `${poPrefix}${Math.floor(1000 + Math.random() * 9000)}`,
         orderDate: data.col7 || today,
         deliveryDueDate: '',
         projectId: data.col2 || '',
@@ -185,7 +652,7 @@ export default function App() {
         status: 'pending',
         creditTerms: data.col30 || 'เครดิต 30 วัน',
         deliveryLocation: data.col37 || '',
-        orderedBy: data.col9 || '',
+        orderedBy: data.col9 || currentUser.fullName,
         notes: data.col38 || '',
         image: imageBase64,
         createdAt: new Date().toISOString(),
@@ -195,53 +662,6 @@ export default function App() {
       setIsPOEditOpen(true);
       showToast('AI ตรวจพบว่าเป็น "ใบสั่งซื้อสินค้า (PO)" นำเข้าสู่ระบบ PO ให้ตรวจสอบแล้ว!');
       return;
-    }
-
-    // Auto-match Destination Weighbridge tickets directly into existing origin DO / Weighbridge record
-    if (data.docType === 'dest_weighbridge') {
-      const cleanPlate = (data.col10 || '').replace(/[^0-9ก-ฮa-zA-Z]/g, '');
-      const refDO = (data.referenceDocNo || data.col6 || '').trim().toLowerCase();
-
-      const candidate = orders.find(ord => {
-        if (ord.docType === 'dest_weighbridge' || ord.docType === 'tax_invoice') return false;
-        if (Number(ord.col18) > 0) return false; // Already has destination weight
-
-        const ordPlate = (ord.col10 || '').replace(/[^0-9ก-ฮa-zA-Z]/g, '');
-        const ordDO = (ord.col6 || '').trim().toLowerCase();
-
-        const matchPlate = cleanPlate && ordPlate && (cleanPlate === ordPlate || ordPlate.includes(cleanPlate) || cleanPlate.includes(ordPlate));
-        const matchRefDO = refDO && ordDO && (ordDO.includes(refDO) || refDO.includes(ordDO));
-
-        return matchPlate || matchRefDO;
-      });
-
-      if (candidate) {
-        const grossD = Number(data.col18) || 0;
-        const tareD = Number(data.col19) || 0;
-        const netD = Number(data.col20) || Math.max(0, grossD - tareD);
-        const netO = Number(candidate.col15) || 0;
-        const diff = (netO > 0 && netD > 0) ? (netO - netD) : 0;
-
-        const updatedCandidate: OrderRecord = {
-          ...candidate,
-          col16: data.col16 || data.col7 || new Date().toISOString().split('T')[0],
-          col17: data.col17 || data.col6 || '',
-          col18: grossD,
-          col19: tareD,
-          col20: netD,
-          col21: diff,
-          col38: candidate.col38 
-            ? `${candidate.col38} | ชนตั๋วปลายทาง: ${data.col17 || data.col6 || ''}` 
-            : `ชนตั๋วปลายทาง: ${data.col17 || data.col6 || ''}`
-        };
-
-        setVerifyOrderData(updatedCandidate);
-        setVerifyImage(imageBase64);
-        setVerifyStoreSuggestion(storeSuggestion);
-        setIsVerifyOpen(true);
-        showToast(`AI จับคู่ตั๋วปลายทางเข้ากับ ${candidate.col1} (ทะเบียน ${candidate.col10}) สำเร็จ! กรุณาตรวจสอบ`);
-        return;
-      }
     }
 
     setVerifyOrderData(data);
@@ -261,61 +681,352 @@ export default function App() {
     showToast('สลับเข้าสู่หน้าต่างบันทึกใบสั่งซื้อ (PO) เรียบร้อยแล้ว');
   };
 
-  // Save verified order (either new or updated)
+  // Save verified order (either new or updated) with automatic DO matching for dest_weighbridge and tax_invoice
   const handleSaveOrder = (order: OrderRecord, storeToSave?: StoreMerchant) => {
-    let nextOrders: OrderRecord[] = [];
-    setOrders(prev => {
-      const idx = prev.findIndex(o => o.id === order.id);
-      if (idx >= 0) {
-        nextOrders = [...prev];
-        nextOrders[idx] = order;
-      } else {
-        nextOrders = [order, ...prev];
+    const isExistingRecord = orders.some(o => o.id === order.id);
+    if (!isExistingRecord) {
+      const blockingDups = checkDuplicateOrder(order, orders, order.image).filter(
+        d => d.level === 'exact' || d.level === 'suspected'
+      );
+      if (blockingDups.length > 0) {
+        showToast(`🚫 บล็อกการนำเข้าบิลซ้ำ: ตรงกับรายการ ${blockingDups[0].matchedOrder.col1} ในระบบ`);
+        return;
       }
-      return nextOrders;
-    });
+    }
 
-    // Sync store directory accurately without double counting or inflation
-    setStores(prev => {
-      let nextStores = [...prev];
-      if (storeToSave) {
-        const existingIdx = nextStores.findIndex(s => s.name.trim().toLowerCase() === storeToSave.name.trim().toLowerCase());
-        if (existingIdx >= 0) {
-          nextStores[existingIdx] = {
-            ...nextStores[existingIdx],
-            ...storeToSave,
-            id: nextStores[existingIdx].id // preserve existing store ID
-          };
-        } else {
-          nextStores = [storeToSave, ...nextStores];
+    let autoMatchedNote = '';
+
+    setOrders(prev => {
+      let workingList = [...prev];
+      let orderToSave: OrderRecord = normalizeOrderWeights({
+        ...order,
+        createdBy: order.createdBy || currentUser.fullName,
+        updatedBy: currentUser.fullName
+      });
+
+      // =========================================================================
+      // STRICT REFERENCE-NUMBER-ONLY AUTO-MATCHING (ZONES 1-4) + VERIFICATION FLAGS
+      // ห้ามใช้ข้อมูลทั่วไป (เช่น ทะเบียนรถ ชื่อร้าน สินค้า) มาเดาชนบิลอัตโนมัติเด็ดขาด!
+      // ต้องชนจาก "เลขที่เอกสารอ้างอิง" (ในช่องฟอร์ม, ในหมายเหตุ, หรือลายมือเขียน) เท่านั้น
+      // และทุกรายการที่ระบบทำอัตโนมัติ ต้องติดธง (auto_flagged) ให้ผู้ใช้ตรวจสอบและยืนยันเสมอ
+      // =========================================================================
+      const autoFlagsSet = new Set<string>(orderToSave.autoActionFlags || []);
+
+      if (!isExistingRecord && orderToSave.aiExtracted) {
+        autoFlagsSet.add('🤖 AI สแกนและสกัดข้อมูลจากรูปบิลอัตโนมัติ');
+        if (Number(orderToSave.col15) > 0 && (orderToSave.col23 || '').includes('ตัน')) {
+          autoFlagsSet.add(`📐 คำนวณปริมาณรับเข้า (${orderToSave.col22} ตัน) จากน้ำหนักสุทธิต้นทางอัตโนมัติ`);
         }
       }
-      return syncStoreFinancials(nextStores, nextOrders.length > 0 ? nextOrders : [order, ...orders]);
+
+      // 1A. Case 1: Saving an unlinked Destination Weighbridge ticket -> Auto-match to Origin DO strictly by Reference DO Number
+      if (orderToSave.docType === 'dest_weighbridge' && !orderToSave.linkedViaDocNo) {
+        const textRefs = extractDocReferences(orderToSave.col38);
+        const refCandidates = [
+          orderToSave.referenceDocNo,
+          ...textRefs.doNumbers
+        ].filter(Boolean) as string[];
+
+        if (refCandidates.length > 0) {
+          const candIdx = workingList.findIndex(ord => {
+            if (ord.id === orderToSave.id || ord.docType === 'dest_weighbridge' || ord.docType === 'tax_invoice') return false;
+            if (Number(ord.col18) > 0 || Number(ord.col20) > 0) return false;
+            if (!ord.col6) return false;
+            return refCandidates.some(ref => isDocNumberMatch(ord.col6, ref));
+          });
+
+          if (candIdx >= 0) {
+            const candidate = workingList[candIdx];
+            const grossD = Number(orderToSave.col18) || 0;
+            const tareD = Number(orderToSave.col19) || 0;
+            const netD = Number(orderToSave.col20) || Math.max(0, grossD - tareD);
+            const netO = Number(candidate.col15) || 0;
+            const diff = (netO > 0 && netD > 0) ? (netO - netD) : 0;
+            const destTicketNo = orderToSave.col17 || orderToSave.col6 || orderToSave.col1;
+            const candFlags = new Set<string>(candidate.autoActionFlags || []);
+            candFlags.add(`⚖️ ชนตั๋วชั่งปลายทาง #${destTicketNo} เข้าโซน 4 อัตโนมัติ (อ้างอิงเลข DO ${candidate.col6})`);
+
+            workingList[candIdx] = {
+              ...candidate,
+              col16: orderToSave.col16 || orderToSave.col7 || new Date().toISOString().split('T')[0],
+              col17: destTicketNo,
+              col18: grossD,
+              col19: tareD,
+              col20: netD,
+              col21: diff,
+              destMatchStatus: 'auto_flagged',
+              matchedDestTicketId: orderToSave.id,
+              autoActionFlags: Array.from(candFlags),
+              autoFlagsVerified: false,
+              updatedBy: currentUser.fullName,
+              col38: candidate.col38
+                ? `${candidate.col38} | ชนตั๋วปลายทางอัตโนมัติ: ${destTicketNo}`
+                : `ชนตั๋วปลายทางอัตโนมัติ: ${destTicketNo}`
+            };
+            orderToSave.linkedViaDocNo = candidate.col6 || candidate.col1;
+            orderToSave.destMatchStatus = 'auto_flagged';
+            autoFlagsSet.add(`⚖️ ชนเข้าใบส่งของ DO ${candidate.col6 || candidate.col1} อัตโนมัติ (ตามเลขอ้างอิง)`);
+            orderToSave.autoActionFlags = Array.from(autoFlagsSet);
+            orderToSave.autoFlagsVerified = false;
+            autoMatchedNote = `🚩 ชนตั๋วชั่งปลายทางเข้ากับ DO ${candidate.col6 || candidate.col1} อัตโนมัติแล้ว (ติดธงรอตรวจสอบยืนยัน)`;
+          }
+        }
+      }
+
+      // 1B. Case 2 (Reverse Direction): Saving an Origin DO -> Check if an unlinked Destination Weighbridge ticket is waiting with a matching DO Reference!
+      if (orderToSave.docType !== 'dest_weighbridge' && orderToSave.docType !== 'tax_invoice') {
+        if (Number(orderToSave.col18) === 0 && Number(orderToSave.col20) === 0 && orderToSave.col6) {
+          const doTextRefs = extractDocReferences(orderToSave.col38);
+          const waitingDestIdx = workingList.findIndex(ticket => {
+            if (ticket.id === orderToSave.id || ticket.docType !== 'dest_weighbridge' || ticket.linkedViaDocNo) return false;
+            const ticketTextRefs = extractDocReferences(ticket.col38);
+            const ticketRefsToDO = [ticket.referenceDocNo, ...ticketTextRefs.doNumbers].filter(Boolean) as string[];
+            const matchesDO = ticketRefsToDO.some(ref => isDocNumberMatch(orderToSave.col6, ref));
+            const doRefsToTicket = [orderToSave.col17, ...doTextRefs.doNumbers].filter(Boolean) as string[];
+            const matchesTicketNo = Boolean(ticket.col17 && doRefsToTicket.some(ref => isDocNumberMatch(ticket.col17, ref)));
+            return matchesDO || matchesTicketNo;
+          });
+
+          if (waitingDestIdx >= 0) {
+            const waitingTicket = workingList[waitingDestIdx];
+            const grossD = Number(waitingTicket.col18) || 0;
+            const tareD = Number(waitingTicket.col19) || 0;
+            const netD = Number(waitingTicket.col20) || Math.max(0, grossD - tareD);
+            const netO = Number(orderToSave.col15) || 0;
+            const diff = (netO > 0 && netD > 0) ? (netO - netD) : 0;
+            const destTicketNo = waitingTicket.col17 || waitingTicket.col6 || waitingTicket.col1;
+
+            orderToSave.col16 = waitingTicket.col16 || waitingTicket.col7 || orderToSave.col7;
+            orderToSave.col17 = destTicketNo;
+            orderToSave.col18 = grossD;
+            orderToSave.col19 = tareD;
+            orderToSave.col20 = netD;
+            orderToSave.col21 = diff;
+            orderToSave.destMatchStatus = 'auto_flagged';
+            orderToSave.matchedDestTicketId = waitingTicket.id;
+            orderToSave.col38 = orderToSave.col38
+              ? `${orderToSave.col38} | ดึงตั๋วปลายทางอัตโนมัติ: ${destTicketNo}`
+              : `ดึงตั๋วปลายทางอัตโนมัติ: ${destTicketNo}`;
+
+            autoFlagsSet.add(`⚖️ ดึงตั๋วชั่งปลายทาง #${destTicketNo} ที่พักรอไว้มาชนโซน 4 อัตโนมัติ (ตามเลขอ้างอิง DO ${orderToSave.col6})`);
+
+            const ticketFlags = new Set<string>(waitingTicket.autoActionFlags || []);
+            ticketFlags.add(`⚖️ ถูกดึงไปชนเข้า DO ${orderToSave.col6} อัตโนมัติ`);
+            workingList[waitingDestIdx] = {
+              ...waitingTicket,
+              linkedViaDocNo: orderToSave.col6 || orderToSave.col1,
+              destMatchStatus: 'auto_flagged',
+              autoActionFlags: Array.from(ticketFlags),
+              autoFlagsVerified: false
+            };
+
+            autoMatchedNote = `🚩 ดึงตั๋วชั่งปลายทาง #${destTicketNo} มาชนเข้า DO ${orderToSave.col6} อัตโนมัติแล้ว (ติดธงรอตรวจสอบยืนยัน)`;
+          }
+        }
+
+        // 1C. Auto-Match Origin DO with Purchase Order (PO — Zone 1 Col 4) strictly by Reference PO Number
+        const doTextRefs = extractDocReferences(orderToSave.col38);
+        const poRefCandidates = [
+          orderToSave.col4,
+          orderToSave.referenceDocNo,
+          ...doTextRefs.poNumbers
+        ].filter(Boolean) as string[];
+
+        if (poRefCandidates.length > 0) {
+          const matchedPO = pos.find(p => poRefCandidates.some(ref => isDocNumberMatch(p.poNumber, ref)));
+          if (matchedPO) {
+            const wasAlreadyVerified = orderToSave.poMatchStatus === 'verified' && isDocNumberMatch(orderToSave.col4, matchedPO.poNumber);
+            orderToSave.col4 = matchedPO.poNumber;
+            if (!wasAlreadyVerified) {
+              orderToSave.poMatchStatus = 'auto_flagged';
+              autoFlagsSet.add(`🔗 ชนใบสั่งซื้อ ${matchedPO.poNumber} เข้าช่อง 4 อัตโนมัติ (ตามเลขอ้างอิงในบิล)`);
+            }
+          }
+        }
+      }
+
+      // 2. If saving an unlinked Tax Invoice, try auto-matching to an Origin DO if referenceDocNo matches DO col6
+      if (orderToSave.docType === 'tax_invoice' && !orderToSave.linkedViaDocNo) {
+        const textRefs = extractDocReferences(orderToSave.col38);
+        const refCandidates = [orderToSave.referenceDocNo, ...textRefs.doNumbers].filter(Boolean) as string[];
+        if (refCandidates.length > 0) {
+          const candIdx = workingList.findIndex(ord => {
+            if (ord.id === orderToSave.id || ord.docType === 'dest_weighbridge' || ord.docType === 'tax_invoice') return false;
+            return Boolean(ord.col6 && refCandidates.some(ref => isDocNumberMatch(ord.col6, ref)));
+          });
+
+          if (candIdx >= 0) {
+            const candidateDO = workingList[candIdx];
+            const hasExistingPrice = Number(candidateDO.col29) > 0;
+            const invNo = orderToSave.col6 || orderToSave.col1;
+            const candFlags = new Set<string>(candidateDO.autoActionFlags || []);
+            candFlags.add(`🧾 ชนใบกำกับภาษี #${invNo} อัตโนมัติ (ตามเลขอ้างอิง DO ${candidateDO.col6})`);
+            workingList[candIdx] = {
+              ...candidateDO,
+              col24: hasExistingPrice ? candidateDO.col24 : (Number(orderToSave.col24) || candidateDO.col24),
+              col25: hasExistingPrice ? candidateDO.col25 : (Number(orderToSave.col25) || candidateDO.col25),
+              col28: hasExistingPrice ? candidateDO.col28 : (Number(orderToSave.col28) || candidateDO.col28),
+              col29: hasExistingPrice ? candidateDO.col29 : (Number(orderToSave.col29) || candidateDO.col29),
+              col30: orderToSave.col30 || candidateDO.col30 || 'โอนเงิน',
+              col31: Number(orderToSave.col31) || 0,
+              col32: Number(orderToSave.col32) || 0,
+              col33: Number(orderToSave.col33) || 0,
+              col34: Number(orderToSave.col34) || 0,
+              col35: Number(orderToSave.col35) || Number(orderToSave.col31) || 0,
+              col36: Number(orderToSave.col36) || 0,
+              autoActionFlags: Array.from(candFlags),
+              autoFlagsVerified: false,
+              updatedBy: currentUser.fullName,
+              col38: candidateDO.col38
+                ? `${candidateDO.col38} | ชนใบกำกับภาษี: ${invNo}`
+                : `ชนใบกำกับภาษี: ${invNo}`
+            };
+            orderToSave.linkedViaDocNo = candidateDO.col6 || candidateDO.col1;
+            autoFlagsSet.add(`🧾 ชนเข้า DO ${candidateDO.col6 || candidateDO.col1} อัตโนมัติ`);
+            autoMatchedNote = `🚩 จับคู่ใบกำกับภาษีเข้ากับ DO ${candidateDO.col6 || candidateDO.col1} อัตโนมัติแล้ว (ติดธงรอตรวจสอบยืนยัน)`;
+          }
+        }
+      }
+
+      if (autoFlagsSet.size > 0) {
+        orderToSave.autoActionFlags = Array.from(autoFlagsSet);
+        if (
+          !isExistingRecord ||
+          orderToSave.poMatchStatus === 'auto_flagged' ||
+          orderToSave.destMatchStatus === 'auto_flagged'
+        ) {
+          orderToSave.autoFlagsVerified = Boolean(orderToSave.autoFlagsVerified);
+        }
+      }
+
+      const idx = workingList.findIndex(o => o.id === orderToSave.id);
+      if (idx >= 0) {
+        workingList[idx] = orderToSave;
+      } else {
+        workingList = [orderToSave, ...workingList];
+      }
+
+      workingList = reconcileAndHealOrders(workingList);
+
+      setStores(prevStores => {
+        let nextStores = [...prevStores];
+        if (storeToSave) {
+          const existingIdx = nextStores.findIndex(s => s.name.trim().toLowerCase() === storeToSave.name.trim().toLowerCase());
+          if (existingIdx >= 0) {
+            const prevGoods = nextStores[existingIdx].primaryGoods || [];
+            const incomingGoods = storeToSave.primaryGoods || (orderToSave.col11 ? [orderToSave.col11] : []);
+            const mergedGoods = Array.from(new Set([...prevGoods, ...incomingGoods.filter(Boolean)]));
+            nextStores[existingIdx] = {
+              ...nextStores[existingIdx],
+              ...storeToSave,
+              primaryGoods: mergedGoods,
+              id: nextStores[existingIdx].id
+            };
+          } else {
+            nextStores = [storeToSave, ...nextStores];
+          }
+        } else if (orderToSave.col8 && orderToSave.col11) {
+          const existingIdx = nextStores.findIndex(s => s.name.trim().toLowerCase() === orderToSave.col8.trim().toLowerCase());
+          if (existingIdx >= 0) {
+            const prevGoods = nextStores[existingIdx].primaryGoods || [];
+            if (!prevGoods.some(g => g.trim().toLowerCase() === orderToSave.col11.trim().toLowerCase())) {
+              nextStores[existingIdx] = {
+                ...nextStores[existingIdx],
+                primaryGoods: [...prevGoods, orderToSave.col11.trim()]
+              };
+            }
+          }
+        }
+        return syncStoreFinancials(nextStores, workingList);
+      });
+
+      return workingList;
     });
 
-    showToast('บันทึกข้อมูลตั๋วชั่ง/คำสั่งซื้อเรียบร้อยแล้ว!');
+    // If user entered a new project name (and didn't pick an existing one), register it as a new project in the database
+    if (order.col2 && order.col2.trim() && order.col2.trim() !== 'โครงการทั่วไป') {
+      const cleanProj = order.col2.trim();
+      setProjects(prev => {
+        const exists = prev.some(p => p.name.trim().toLowerCase() === cleanProj.toLowerCase());
+        if (exists) return prev;
+        return [
+          {
+            id: `proj-${Date.now()}`,
+            name: cleanProj,
+            location: order.col37 || '',
+            status: 'active',
+            createdAt: new Date().toISOString()
+          },
+          ...prev
+        ];
+      });
+    }
+
+    // If this order was verified from the LINE OA Bot Inbox, mark the inbox item as verified
+    if (order.lineInboxId) {
+      setLineInbox(prev =>
+        prev.map(item =>
+          item.id === order.lineInboxId
+            ? {
+                ...item,
+                status: 'verified',
+                verifiedOrderId: order.col1,
+                verifiedBy: currentUser.fullName,
+                verifiedAt: new Date().toISOString(),
+                extractedData: {
+                  ...item.extractedData,
+                  ...order
+                }
+              }
+            : item
+        )
+      );
+    }
+
+    if (order.docType === 'dest_weighbridge' && !autoMatchedNote) {
+      setActiveTab('dest_wb');
+      showToast('บันทึกในแถบ "ตั๋วชั่งปลายทาง" เรียบร้อยแล้ว (รอชนบิลเข้า DO)');
+    } else if (order.docType === 'tax_invoice' && !autoMatchedNote) {
+      setActiveTab('tax_inv');
+      showToast('บันทึกในแถบ "ใบเสร็จ/กำกับภาษี" เรียบร้อยแล้ว (รอชนบิลเข้า DO)');
+    } else if (autoMatchedNote) {
+      showToast(autoMatchedNote);
+    } else {
+      showToast('บันทึกข้อมูลตั๋วชั่ง/คำสั่งซื้อเรียบร้อยแล้ว!');
+    }
   };
 
-  // Add new blank order
+  // Add new blank order tailored to the active menu
   const handleAddNewOrder = () => {
+    if (!currentPermissions.canCreateOrder) {
+      showToast(`🚫 บัญชีของคุณ (${currentPermissions.label}) ไม่มีสิทธิ์เพิ่มบิลใหม่`, 'info');
+      return;
+    }
     const today = new Date().toISOString().split('T')[0];
+    const trPrefix = systemSettings.trPrefix || `TR-${new Date().getFullYear()}-`;
+    const targetDocType =
+      activeTab === 'dest_wb' ? 'dest_weighbridge' :
+      activeTab === 'tax_inv' ? 'tax_invoice' :
+      'delivery_order';
+
     const newDraft: Partial<OrderRecord> = {
-      col1: 'TR-' + new Date().getFullYear() + '-' + Math.floor(100 + Math.random() * 900),
-      col2: '',
+      docType: targetDocType,
+      col1: `${trPrefix}${Math.floor(100 + Math.random() * 900)}`,
+      col2: currentUser.assignedProjects?.[0] || '',
       col3: '',
       col4: '',
       col5: '',
       col6: '',
       col7: today,
       col8: '',
-      col9: '',
+      col9: currentUser.fullName,
       col10: '',
       col11: '',
       col12: '',
       col13: 0,
       col14: 0,
       col15: 0,
-      col16: '',
+      col16: targetDocType === 'dest_weighbridge' ? today : '',
       col17: '',
       col18: 0,
       col19: 0,
@@ -349,17 +1060,22 @@ export default function App() {
 
   // Add new order specifically for an existing store
   const handleAddNewOrderForStore = (store: StoreMerchant) => {
+    if (!currentPermissions.canCreateOrder) {
+      showToast(`🚫 บัญชีของคุณ (${currentPermissions.label}) ไม่มีสิทธิ์เพิ่มบิลใหม่`, 'info');
+      return;
+    }
     const today = new Date().toISOString().split('T')[0];
+    const trPrefix = systemSettings.trPrefix || `TR-${new Date().getFullYear()}-`;
     const newDraft: Partial<OrderRecord> = {
-      col1: 'TR-' + new Date().getFullYear() + '-' + Math.floor(100 + Math.random() * 900),
-      col2: '',
+      col1: `${trPrefix}${Math.floor(100 + Math.random() * 900)}`,
+      col2: currentUser.assignedProjects?.[0] || '',
       col3: store.category || '',
       col4: '',
       col5: '',
       col6: '',
       col7: today,
       col8: store.name,
-      col9: '',
+      col9: currentUser.fullName,
       col10: '',
       col11: store.primaryGoods?.[0] || '',
       col12: '',
@@ -401,33 +1117,126 @@ export default function App() {
 
   // Duplicate an existing order
   const handleDuplicateOrder = (order: OrderRecord) => {
+    if (!currentPermissions.canCreateOrder) {
+      showToast(`🚫 บัญชีของคุณ (${currentPermissions.label}) ไม่มีสิทธิ์คัดลอกบิล`, 'info');
+      return;
+    }
     const duplicated: OrderRecord = {
       ...order,
       id: 'ord-' + Date.now(),
       col1: order.col1 + '-COPY',
+      col6: order.col6 ? `${order.col6}-COPY` : '',
+      col16: order.docType === 'dest_weighbridge' ? order.col16 : '',
+      col17: order.docType === 'dest_weighbridge' ? (order.col17 ? `${order.col17}-COPY` : '') : '',
+      col18: order.docType === 'dest_weighbridge' ? order.col18 : 0,
+      col19: order.docType === 'dest_weighbridge' ? order.col19 : 0,
+      col20: order.docType === 'dest_weighbridge' ? order.col20 : 0,
+      col21: 0,
+      linkedViaDocNo: '',
+      matchedDestTicketId: undefined,
+      poMatchStatus: undefined,
+      destMatchStatus: undefined,
+      autoActionFlags: [],
+      autoFlagsVerified: true,
+      lineInboxId: undefined,
+      createdBy: currentUser.fullName,
       createdAt: new Date().toISOString()
     };
-    const nextOrders = [duplicated, ...orders];
-    setOrders(nextOrders);
-    setStores(prev => syncStoreFinancials(prev, nextOrders));
+    setOrders(prev => {
+      const nextOrders = [duplicated, ...prev];
+      setStores(prevStores => syncStoreFinancials(prevStores, nextOrders));
+      return nextOrders;
+    });
     showToast(`คัดลอกรายการ ${order.col1} สำเร็จ!`);
   };
 
-  // Delete order
-  const handleDeleteOrder = (id: string) => {
-    if (confirm('คุณต้องการลบรายการเอกสารนี้หรือไม่?')) {
-      const nextOrders = orders.filter(o => o.id !== id);
-      setOrders(nextOrders);
-      setStores(prev => syncStoreFinancials(prev, nextOrders));
-      showToast('ลบรายการเรียบร้อยแล้ว');
+  // Delete order (with cascade cleanup of linked Dest Weighbridge, Tax Invoice, or DO Zone 4)
+  const handleDeleteOrder = (id: string, skipConfirm = false) => {
+    if (!currentPermissions.canDeleteOrder) {
+      showToast(`🚫 บัญชีของคุณ (${currentPermissions.label}) ไม่มีสิทธิ์ลบรายการบิล`, 'info');
+      return;
+    }
+    setOrders(prev => {
+      const target = prev.find(o => o.id === id);
+      let remaining = prev.filter(o => o.id !== id);
+
+      if (target) {
+        if (target.docType === 'dest_weighbridge') {
+          // Unlink Zone 4 on any DO that had this destination weighbridge ticket matched
+          const ticketNo = target.col17 || target.col6 || target.col1;
+          remaining = remaining.map(ord => {
+            if (ord.docType === 'dest_weighbridge' || ord.docType === 'tax_invoice') return ord;
+            const isMatched =
+              ord.matchedDestTicketId === target.id ||
+              (target.linkedViaDocNo && (isDocNumberMatch(ord.col6, target.linkedViaDocNo) || isDocNumberMatch(ord.col1, target.linkedViaDocNo))) ||
+              (ticketNo && ord.col17 && isDocNumberMatch(ord.col17, ticketNo));
+            if (!isMatched) return ord;
+            return {
+              ...ord,
+              col16: '',
+              col17: '',
+              col18: 0,
+              col19: 0,
+              col20: 0,
+              col21: 0,
+              matchedDestTicketId: undefined,
+              destMatchStatus: undefined,
+              autoActionFlags: (ord.autoActionFlags || []).filter(f => !f.includes('ตั๋วชั่งปลายทาง'))
+            };
+          });
+        } else if (target.docType !== 'tax_invoice') {
+          // Deleting a DO: release any dest_weighbridge or tax_invoice that was linked to this DO
+          const doNo = target.col6 || target.col1;
+          remaining = remaining.map(ord => {
+            if (ord.docType === 'dest_weighbridge') {
+              const linkedToDeletedDO =
+                target.matchedDestTicketId === ord.id ||
+                (ord.linkedViaDocNo && doNo && (isDocNumberMatch(ord.linkedViaDocNo, target.col6) || isDocNumberMatch(ord.linkedViaDocNo, target.col1)));
+              if (linkedToDeletedDO) {
+                return {
+                  ...ord,
+                  linkedViaDocNo: '',
+                  destMatchStatus: undefined
+                };
+              }
+            } else if (ord.docType === 'tax_invoice' && ord.linkedViaDocNo && doNo) {
+              const parts = ord.linkedViaDocNo.split(',').map(s => s.trim()).filter(Boolean);
+              const kept = parts.filter(p => !isDocNumberMatch(p, target.col6) && !isDocNumberMatch(p, target.col1));
+              if (kept.length !== parts.length) {
+                return {
+                  ...ord,
+                  linkedViaDocNo: kept.join(', ')
+                };
+              }
+            }
+            return ord;
+          });
+        }
+      }
+
+      setStores(prevStores => syncStoreFinancials(prevStores, remaining));
+      return remaining;
+    });
+    if (!skipConfirm) {
+      showToast('ลบรายการและอัปเดตสถานะเอกสารที่เชื่อมโยงเรียบร้อยแล้ว');
     }
   };
 
   // Update order inline
   const handleUpdateOrder = (updatedOrder: OrderRecord) => {
-    const nextOrders = orders.map(o => o.id === updatedOrder.id ? updatedOrder : o);
-    setOrders(nextOrders);
-    setStores(prev => syncStoreFinancials(prev, nextOrders));
+    if (!currentPermissions.canEditOrder) {
+      showToast(`🚫 บัญชีของคุณ (${currentPermissions.label}) ไม่มีสิทธิ์แก้ไขบิล`, 'info');
+      return;
+    }
+    setOrders(prev => {
+      const nextOrders = reconcileAndHealOrders(
+        prev.map(o =>
+          o.id === updatedOrder.id ? { ...updatedOrder, updatedBy: currentUser.fullName } : o
+        )
+      );
+      setStores(prevStores => syncStoreFinancials(prevStores, nextOrders));
+      return nextOrders;
+    });
     showToast('อัปเดตรายการเรียบร้อยแล้ว');
   };
 
@@ -442,6 +1251,15 @@ export default function App() {
 
   // ================= PO MANAGEMENT HANDLERS =================
   const handleSavePO = (savedPO: PurchaseOrder) => {
+    const isExistingPO = pos.some(p => p.id === savedPO.id);
+    if (!isExistingPO) {
+      const blockingPODups = checkDuplicatePO(savedPO, pos, savedPO.image);
+      if (blockingPODups.length > 0) {
+        showToast(`🚫 บล็อกการนำเข้า PO ซ้ำ: เลขที่ ${blockingPODups[0].matchedPO.poNumber} มีอยู่ในระบบแล้ว`);
+        return;
+      }
+    }
+
     setPos(prev => {
       const idx = prev.findIndex(p => p.id === savedPO.id);
       if (idx >= 0) {
@@ -452,45 +1270,152 @@ export default function App() {
       return [savedPO, ...prev];
     });
 
-    // Check if store should also be added to directory
+    // Check if store should also be added to directory or have its primaryGoods updated
     if (savedPO.storeName) {
       setStores(prev => {
-        const found = prev.find(s => s.name.trim().toLowerCase() === savedPO.storeName.trim().toLowerCase());
-        if (!found) {
+        const idx = prev.findIndex(s => s.name.trim().toLowerCase() === savedPO.storeName.trim().toLowerCase());
+        const poItemNames = (savedPO.items || []).map(i => i.itemDescription?.trim()).filter(Boolean);
+        if (idx === -1) {
           const newStore: StoreMerchant = {
             id: `store-${Date.now()}`,
-            name: savedPO.storeName,
+            name: savedPO.storeName.trim(),
             category: savedPO.category || 'ทั่วไป',
             creditTerms: savedPO.creditTerms || 'เครดิต 30 วัน',
             totalOrders: 0,
             totalPurchases: savedPO.totalAmount || 0,
             totalPaid: 0,
             totalDebt: savedPO.totalAmount || 0,
-            primaryGoods: savedPO.items?.map(i => i.itemDescription) || []
+            primaryGoods: poItemNames
           };
           return [newStore, ...prev];
+        } else {
+          const existingStore = prev[idx];
+          const mergedGoods = Array.from(new Set([...(existingStore.primaryGoods || []), ...poItemNames]));
+          const copy = [...prev];
+          copy[idx] = { ...existingStore, primaryGoods: mergedGoods };
+          return copy;
         }
-        return prev;
       });
     }
+
+    // Check if project should also be added to directory when saved as a new project name
+    if (savedPO.projectId && savedPO.projectId.trim() && savedPO.projectId.trim() !== 'โครงการทั่วไป') {
+      const cleanProj = savedPO.projectId.trim();
+      setProjects(prev => {
+        const exists = prev.some(p => p.name.trim().toLowerCase() === cleanProj.toLowerCase());
+        if (exists) return prev;
+        return [
+          {
+            id: `proj-${Date.now()}`,
+            name: cleanProj,
+            location: savedPO.deliveryLocation || '',
+            status: 'active',
+            createdAt: new Date().toISOString()
+          },
+          ...prev
+        ];
+      });
+    }
+
+    // If this PO was verified from the LINE OA Bot Inbox, mark the inbox item as verified
+    if (savedPO.lineInboxId) {
+      setLineInbox(prev =>
+        prev.map(item =>
+          item.id === savedPO.lineInboxId
+            ? {
+                ...item,
+                status: 'verified',
+                verifiedOrderId: savedPO.poNumber,
+                verifiedBy: currentUser.fullName,
+                verifiedAt: new Date().toISOString(),
+                extractedData: {
+                  ...item.extractedData,
+                  col2: savedPO.projectId,
+                  col4: savedPO.poNumber,
+                  col8: savedPO.storeName
+                }
+              }
+            : item
+        )
+      );
+    }
+
+    // Reverse Auto-Match: If DOs arrived BEFORE this PO was saved, and those DOs have a reference to this PO number,
+    // automatically link them to this PO and attach an auto_flagged verification flag!
+    let autoLinkedDOCount = 0;
+    setOrders(prevOrders =>
+      prevOrders.map(ord => {
+        if (ord.docType === 'dest_weighbridge' || ord.docType === 'tax_invoice') return ord;
+        const textRefs = extractDocReferences(ord.col38);
+        const matchesThisPO =
+          isDocNumberMatch(ord.col4, savedPO.poNumber) ||
+          isDocNumberMatch(ord.referenceDocNo, savedPO.poNumber) ||
+          textRefs.poNumbers.some(p => isDocNumberMatch(p, savedPO.poNumber));
+
+        if (matchesThisPO) {
+          const alreadyVerified = ord.poMatchStatus === 'verified' && ord.col4 === savedPO.poNumber;
+          if (!alreadyVerified) {
+            autoLinkedDOCount++;
+            const nextFlags = new Set<string>(ord.autoActionFlags || []);
+            nextFlags.add(`🔗 ชนใบสั่งซื้อ ${savedPO.poNumber} อัตโนมัติ (ตามเลขอ้างอิงในบิล)`);
+            return {
+              ...ord,
+              col4: savedPO.poNumber,
+              poMatchStatus: 'auto_flagged',
+              autoActionFlags: Array.from(nextFlags),
+              autoFlagsVerified: false
+            };
+          }
+        }
+        return ord;
+      })
+    );
 
     // If detail modal was open for this PO, update it
     if (selectedPOForDetail && selectedPOForDetail.id === savedPO.id) {
       setSelectedPOForDetail(savedPO);
     }
 
-    showToast(`บันทึกใบสั่งซื้อ ${savedPO.poNumber} เรียบร้อยแล้ว!`);
+    if (autoLinkedDOCount > 0) {
+      showToast(`บันทึก PO ${savedPO.poNumber} และชนบิล DO อัตโนมัติ ${autoLinkedDOCount} ใบ (ติดธงรอตรวจสอบยืนยัน)!`);
+    } else {
+      showToast(`บันทึกใบสั่งซื้อ ${savedPO.poNumber} เรียบร้อยแล้ว!`);
+    }
   };
 
   const handleDeletePO = (id: string) => {
+    if (!currentPermissions.canDeleteOrder) {
+      showToast(`🚫 บัญชีของคุณ (${currentPermissions.label}) ไม่มีสิทธิ์ลบใบสั่งซื้อ`, 'info');
+      return;
+    }
+    const targetPO = pos.find(p => p.id === id);
     setPos(prev => prev.filter(p => p.id !== id));
+    if (targetPO?.poNumber) {
+      setOrders(prev =>
+        prev.map(ord => {
+          if (ord.col4 && isDocNumberMatch(ord.col4, targetPO.poNumber)) {
+            return {
+              ...ord,
+              col4: '',
+              poMatchStatus: undefined,
+              autoActionFlags: (ord.autoActionFlags || []).filter(f => !f.includes('ชนใบสั่งซื้อ'))
+            };
+          }
+          return ord;
+        })
+      );
+    }
     if (selectedPOForDetail?.id === id) {
       setSelectedPOForDetail(null);
     }
-    showToast('ลบใบสั่งซื้อเรียบร้อยแล้ว');
+    showToast('ลบใบสั่งซื้อและปลดการผูกกับใบส่งของเรียบร้อยแล้ว');
   };
 
   const handleOpenCreatePO = (initialStoreName?: string) => {
+    if (!currentPermissions.canManagePO) {
+      showToast(`🚫 บัญชีของคุณ (${currentPermissions.label}) ไม่มีสิทธิ์เปิดใบสั่งซื้อใหม่`, 'info');
+      return;
+    }
     setEditingPO(null);
     setInitialStoreNameForPO(initialStoreName);
     setIsPOEditOpen(true);
@@ -498,9 +1423,10 @@ export default function App() {
 
   const handlePOScanComplete = (poData: Partial<PurchaseOrder>, imageBase64: string) => {
     const today = new Date().toISOString().split('T')[0];
+    const poPrefix = systemSettings.poPrefix || `PO-${new Date().getFullYear()}-`;
     const newPO: PurchaseOrder = {
       id: `po-${Date.now()}`,
-      poNumber: poData.poNumber || `PO-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`,
+      poNumber: poData.poNumber || `${poPrefix}${Math.floor(1000 + Math.random() * 9000)}`,
       orderDate: poData.orderDate || today,
       deliveryDueDate: poData.deliveryDueDate || '',
       projectId: poData.projectId || '',
@@ -512,7 +1438,7 @@ export default function App() {
       status: 'pending',
       creditTerms: poData.creditTerms || 'เครดิต 30 วัน',
       deliveryLocation: poData.deliveryLocation || '',
-      orderedBy: poData.orderedBy || '',
+      orderedBy: poData.orderedBy || currentUser.fullName,
       approvedBy: poData.approvedBy || '',
       notes: poData.notes || '',
       image: imageBase64,
@@ -528,9 +1454,10 @@ export default function App() {
   // Quick action: Create an inbound ticket/bill linked directly to this PO
   const handleAddTicketForPO = (po: PurchaseOrder) => {
     const today = new Date().toISOString().split('T')[0];
+    const trPrefix = systemSettings.trPrefix || `TR-${new Date().getFullYear()}-`;
     const firstItem = po.items?.[0];
     const newDraft: Partial<OrderRecord> = {
-      col1: 'TR-' + new Date().getFullYear() + '-' + Math.floor(100 + Math.random() * 900),
+      col1: `${trPrefix}${Math.floor(100 + Math.random() * 900)}`,
       col2: po.projectId || '',
       col3: po.category || '',
       col4: po.poNumber, // Link to this PO
@@ -538,7 +1465,7 @@ export default function App() {
       col6: '',
       col7: today,
       col8: po.storeName,
-      col9: '',
+      col9: currentUser.fullName,
       col10: '',
       col11: firstItem?.itemDescription || '',
       col12: firstItem?.specCode || '',
@@ -579,47 +1506,191 @@ export default function App() {
     setIsVerifyOpen(true);
   };
 
-  // User Manual Match: Link an unlinked order to this PO strictly by user decision
+  // User Manual Match: Link an unlinked order to this PO strictly by user decision (marked as verified)
   const handleLinkOrderToPO = (orderId: string, poNumber: string) => {
+    const targetPO = pos.find(p => p.poNumber === poNumber);
     setOrders(prev => prev.map(ord => {
       if (ord.id === orderId) {
         return {
           ...ord,
           col4: poNumber,
-          col38: ord.col38 ? `${ord.col38} (ชนบิลเข้า PO: ${poNumber})` : `ชนบิลเข้า PO: ${poNumber}`
+          col2: (!ord.col2 || ord.col2 === 'โครงการทั่วไป') && targetPO?.projectId ? targetPO.projectId : ord.col2,
+          poMatchStatus: 'verified',
+          updatedBy: currentUser.fullName,
+          col38: ord.col38 ? `${ord.col38} | ชน PO ด้วยมือ: ${poNumber}` : `ชน PO ด้วยมือ: ${poNumber}`
         };
       }
       return ord;
     }));
-    showToast(`ชนบิลตั๋วเข้า PO ${poNumber} เรียบร้อยแล้ว!`);
+    showToast(`✅ ชนบิลตั๋วเข้า PO ${poNumber} ด้วยมือเรียบร้อยแล้ว!`);
   };
 
   // Unlink an order from a PO
   const handleUnlinkOrderFromPO = (orderId: string) => {
     setOrders(prev => prev.map(ord => {
       if (ord.id === orderId) {
+        const filteredFlags = (ord.autoActionFlags || []).filter(f => !f.includes('ชนใบสั่งซื้อ'));
         return {
           ...ord,
-          col4: ''
+          col4: '',
+          poMatchStatus: undefined,
+          autoActionFlags: filteredFlags,
+          updatedBy: currentUser.fullName
         };
       }
       return ord;
     }));
-    showToast('ยกเลิกการชนบิลของตั๋วใบนี้แล้ว');
+    showToast('ยกเลิกการชนบิล PO ของตั๋วใบนี้แล้ว');
+  };
+
+  // Confirm / Verify Automatic Flags (Both Auto-Match PO/Dest Ticket & Auto System Actions)
+  const handleVerifyOrderAutoFlags = (orderId: string, scope: 'all' | 'po' | 'dest' = 'all') => {
+    const nowIso = new Date().toISOString();
+    setOrders(prev => {
+      const target = prev.find(o => o.id === orderId);
+      const linkedDestId = target?.matchedDestTicketId;
+      const targetDONo = target?.col6 || target?.col1;
+
+      return prev.map(ord => {
+        if (ord.id === orderId) {
+          const nextPoStatus = (scope === 'all' || scope === 'po') && ord.col4 ? 'verified' : ord.poMatchStatus;
+          const nextDestStatus = (scope === 'all' || scope === 'dest') && (ord.col17 || Number(ord.col20) > 0 || ord.linkedViaDocNo) ? 'verified' : ord.destMatchStatus;
+          const allCleared =
+            nextPoStatus !== 'auto_flagged' &&
+            nextDestStatus !== 'auto_flagged' &&
+            scope === 'all';
+
+          return {
+            ...ord,
+            poMatchStatus: nextPoStatus,
+            destMatchStatus: nextDestStatus,
+            autoFlagsVerified: allCleared ? true : ord.autoFlagsVerified,
+            autoFlagsVerifiedBy: currentUser.fullName,
+            autoFlagsVerifiedAt: nowIso,
+            updatedBy: currentUser.fullName
+          };
+        }
+
+        // Also mark the paired destination weighbridge ticket as verified when confirming Zone 4
+        if (
+          (scope === 'all' || scope === 'dest') &&
+          ord.docType === 'dest_weighbridge' &&
+          ((linkedDestId && ord.id === linkedDestId) || (targetDONo && ord.linkedViaDocNo && isDocNumberMatch(ord.linkedViaDocNo, targetDONo)))
+        ) {
+          return {
+            ...ord,
+            destMatchStatus: 'verified',
+            autoFlagsVerified: true,
+            autoFlagsVerifiedBy: currentUser.fullName,
+            autoFlagsVerifiedAt: nowIso
+          };
+        }
+
+        return ord;
+      });
+    });
+    showToast(`✅ ยืนยันการตรวจสอบรายการอัตโนมัติโดย ${currentUser.fullName} เรียบร้อยแล้ว`);
   };
 
   // Store management handlers
-  const handleSaveStore = (savedStore: StoreMerchant) => {
+  const handleSaveStore = (savedStore: StoreMerchant, oldName?: string) => {
+    const previousStore = stores.find(s => s.id === savedStore.id);
+    const effectiveOldName = oldName || previousStore?.name;
+
+    let updatedOrders = orders;
+    if (effectiveOldName && effectiveOldName.trim() !== savedStore.name.trim()) {
+      const oldKey = effectiveOldName.trim().toLowerCase();
+      updatedOrders = orders.map(o =>
+        (o.storeId === savedStore.id || (o.col8 || '').trim().toLowerCase() === oldKey)
+          ? { ...o, col8: savedStore.name.trim(), storeId: savedStore.id }
+          : o
+      );
+      setOrders(updatedOrders);
+      setPos(prev => prev.map(p =>
+        (p.storeId === savedStore.id || (p.storeName || '').trim().toLowerCase() === oldKey)
+          ? { ...p, storeName: savedStore.name.trim(), storeId: savedStore.id }
+          : p
+      ));
+    }
+
     setStores(prev => {
-      const idx = prev.findIndex(s => s.id === savedStore.id);
+      const idx = prev.findIndex(s => s.id === savedStore.id || (effectiveOldName && s.name.trim().toLowerCase() === effectiveOldName.trim().toLowerCase()));
+      let nextList: StoreMerchant[];
       if (idx >= 0) {
-        const copy = [...prev];
-        copy[idx] = savedStore;
-        return copy;
+        nextList = [...prev];
+        nextList[idx] = savedStore;
+      } else {
+        nextList = [savedStore, ...prev];
       }
-      return [savedStore, ...prev];
+      return syncStoreFinancials(nextList, updatedOrders);
     });
-    showToast(`บันทึกข้อมูลร้านค้า ${savedStore.name} เรียบร้อยแล้ว!`);
+
+    if (selectedStoreForDetail && (selectedStoreForDetail.id === savedStore.id || (effectiveOldName && selectedStoreForDetail.name.trim().toLowerCase() === effectiveOldName.trim().toLowerCase()))) {
+      setSelectedStoreForDetail(savedStore);
+    }
+
+    showToast(`บันทึกข้อมูลร้านค้า "${savedStore.name}" เรียบร้อยแล้ว!`);
+  };
+
+  const handleDeleteStore = (storeToDelete: StoreMerchant) => {
+    if (!currentPermissions.canDeleteOrder) {
+      showToast(`🚫 บัญชีของคุณ (${currentPermissions.label}) ไม่มีสิทธิ์ลบร้านค้า`, 'info');
+      return;
+    }
+    const targetKey = storeToDelete.name.trim().toLowerCase();
+    setStores(prev => prev.filter(s => s.id !== storeToDelete.id && s.name.trim().toLowerCase() !== targetKey));
+    setOrders(prev => prev.map(o => o.storeId === storeToDelete.id ? { ...o, storeId: '' } : o));
+    setPos(prev => prev.map(p => p.storeId === storeToDelete.id ? { ...p, storeId: '' } : p));
+    if (selectedStoreForDetail?.id === storeToDelete.id) {
+      setSelectedStoreForDetail(null);
+    }
+    showToast(`ลบร้านค้า "${storeToDelete.name}" ออกจากทะเบียนเรียบร้อยแล้ว`);
+  };
+
+  const handleSyncStoresFromBills = () => {
+    const existingSet = new Set(stores.map(s => s.name.trim().toLowerCase()));
+    const newStores: StoreMerchant[] = [];
+
+    orders.forEach(o => {
+      const sName = (o.col8 || '').trim();
+      if (sName && !existingSet.has(sName.toLowerCase())) {
+        existingSet.add(sName.toLowerCase());
+        newStores.push({
+          id: `store-${Date.now()}-${newStores.length}`,
+          name: sName,
+          category: o.col3 || 'งานวัสดุก่อสร้าง',
+          creditTerms: o.col30 || 'เครดิต 30 วัน',
+          totalOrders: 0,
+          totalPurchases: 0,
+          totalPaid: 0,
+          totalDebt: 0,
+          primaryGoods: o.col11 ? [o.col11] : []
+        });
+      }
+    });
+
+    pos.forEach(p => {
+      const sName = (p.storeName || '').trim();
+      if (sName && !existingSet.has(sName.toLowerCase())) {
+        existingSet.add(sName.toLowerCase());
+        newStores.push({
+          id: `store-${Date.now()}-${newStores.length}`,
+          name: sName,
+          category: p.category || 'งานวัสดุก่อสร้าง',
+          creditTerms: p.creditTerms || 'เครดิต 30 วัน',
+          totalOrders: 0,
+          totalPurchases: 0,
+          totalPaid: 0,
+          totalDebt: 0,
+          primaryGoods: (p.items || []).map(i => i.itemDescription).filter(Boolean)
+        });
+      }
+    });
+
+    if (newStores.length > 0) {
+      setStores(prev => syncStoreFinancials([...newStores, ...prev], orders));
+      showToast(`ดึงชื่อร้านค้าจากบิลเข้าทะเบียนเพิ่ม ${newStores.length} ร้านเรียบร้อยแล้ว`);
+    }
   };
 
   const handleOpenStoreByName = (storeName: string) => {
@@ -643,115 +1714,476 @@ export default function App() {
 
   // Export full excel (Orders + POs + Stores)
   const handleExportExcel = () => {
+    if (!currentPermissions.canExportReport) {
+      showToast(`🚫 บัญชีของคุณ (${currentPermissions.label}) ไม่มีสิทธิ์ส่งออกรายงาน`, 'info');
+      return;
+    }
     if (orders.length === 0 && stores.length === 0 && pos.length === 0) {
-      alert('ยังไม่มีข้อมูลในระบบสำหรับส่งออก กรุณาสแกนบิลหรือเพิ่มรายการก่อน');
+      showToast('ยังไม่มีข้อมูลในระบบสำหรับส่งออก กรุณาสแกนบิลหรือเพิ่มรายการก่อน', 'info');
       return;
     }
     exportAllDataToExcel(orders, stores, pos);
     showToast('ส่งออกไฟล์ Excel เรียบร้อยแล้ว!');
   };
 
+  // One-time seed of projects from existing orders/POs so existing project names are real records in `projects`
+  useEffect(() => {
+    try {
+      const seeded = localStorage.getItem('autostore_projects_seeded_v1');
+      if (seeded) return;
+      localStorage.setItem('autostore_projects_seeded_v1', 'true');
+      setProjects(prev => {
+        const existingSet = new Set(prev.map(p => p.name.trim().toLowerCase()));
+        const added: ProjectRecord[] = [];
+        orders.forEach(o => {
+          const pName = (o.col2 || '').trim();
+          if (pName && pName !== 'โครงการทั่วไป' && !existingSet.has(pName.toLowerCase())) {
+            existingSet.add(pName.toLowerCase());
+            added.push({
+              id: `proj-seed-${Date.now()}-${added.length}`,
+              name: pName,
+              code: `PRJ-${String(prev.length + added.length + 1).padStart(2, '0')}`,
+              location: o.col37 || '',
+              manager: o.col9 || '',
+              budget: 0,
+              status: 'active',
+              createdAt: o.col7 || new Date().toISOString().split('T')[0]
+            });
+          }
+        });
+        pos.forEach(po => {
+          const pName = (po.projectId || '').trim();
+          if (pName && pName !== 'โครงการทั่วไป' && !existingSet.has(pName.toLowerCase())) {
+            existingSet.add(pName.toLowerCase());
+            added.push({
+              id: `proj-seed-${Date.now()}-${added.length}`,
+              name: pName,
+              code: `PRJ-${String(prev.length + added.length + 1).padStart(2, '0')}`,
+              location: po.deliveryLocation || '',
+              manager: po.orderedBy || '',
+              budget: 0,
+              status: 'active',
+              createdAt: po.orderDate || new Date().toISOString().split('T')[0]
+            });
+          }
+        });
+        return added.length > 0 ? [...prev, ...added] : prev;
+      });
+    } catch {
+      // ignore
+    }
+  }, [orders, pos]);
+
+  // Project management handlers
+  const handleSaveProject = (savedProj: ProjectRecord, oldName?: string) => {
+    setProjects(prev => {
+      const idx = prev.findIndex(p => p.id === savedProj.id || p.name.trim().toLowerCase() === (oldName || savedProj.name).trim().toLowerCase());
+      if (idx >= 0) {
+        const copy = [...prev];
+        copy[idx] = savedProj;
+        return copy;
+      }
+      return [savedProj, ...prev];
+    });
+    // If project was renamed, cascade update to matching orders (col2), POs (projectId), and Users (assignedProjects)
+    if (oldName && oldName.trim() !== savedProj.name.trim()) {
+      const oldKey = oldName.trim().toLowerCase();
+      setOrders(prev => prev.map(o => (o.col2 || '').trim().toLowerCase() === oldKey ? { ...o, col2: savedProj.name } : o));
+      setPos(prev => prev.map(p => (p.projectId || '').trim().toLowerCase() === oldKey ? { ...p, projectId: savedProj.name } : p));
+      setUsers(prev => prev.map(u => ({
+        ...u,
+        assignedProjects: (u.assignedProjects || []).map(pn => pn.trim().toLowerCase() === oldKey ? savedProj.name : pn)
+      })));
+    }
+    showToast(`บันทึกข้อมูลโครงการ "${savedProj.name}" เรียบร้อยแล้ว!`);
+  };
+
+  const handleDeleteProject = (id: string, projectName?: string) => {
+    if (!currentPermissions.canDeleteOrder) {
+      showToast(`🚫 บัญชีของคุณ (${currentPermissions.label}) ไม่มีสิทธิ์ลบโครงการ`, 'info');
+      return;
+    }
+    const targetKey = (projectName || '').trim().toLowerCase();
+    setProjects(prev => prev.filter(p => p.id !== id && (!targetKey || p.name.trim().toLowerCase() !== targetKey)));
+    showToast(`ลบโครงการ "${projectName || ''}" ออกจากทะเบียนเรียบร้อยแล้ว`);
+  };
+
+  const handleSyncProjectsFromBills = () => {
+    const existingSet = new Set(projects.map(p => p.name.trim().toLowerCase()));
+    const newProjects: ProjectRecord[] = [];
+
+    orders.forEach(o => {
+      const pName = (o.col2 || '').trim();
+      if (pName && pName !== 'โครงการทั่วไป' && !existingSet.has(pName.toLowerCase())) {
+        existingSet.add(pName.toLowerCase());
+        newProjects.push({
+          id: `proj-${Date.now()}-${newProjects.length}`,
+          name: pName,
+          code: `PRJ-${String(projects.length + newProjects.length + 1).padStart(2, '0')}`,
+          location: o.col37 || '',
+          manager: o.col9 || '',
+          budget: 0,
+          status: 'active',
+          createdAt: o.col7 || new Date().toISOString().split('T')[0]
+        });
+      }
+    });
+
+    pos.forEach(po => {
+      const pName = (po.projectId || '').trim();
+      if (pName && pName !== 'โครงการทั่วไป' && !existingSet.has(pName.toLowerCase())) {
+        existingSet.add(pName.toLowerCase());
+        newProjects.push({
+          id: `proj-${Date.now()}-${newProjects.length}`,
+          name: pName,
+          code: `PRJ-${String(projects.length + newProjects.length + 1).padStart(2, '0')}`,
+          location: po.deliveryLocation || '',
+          manager: po.orderedBy || '',
+          budget: 0,
+          status: 'active',
+          createdAt: po.orderDate || new Date().toISOString().split('T')[0]
+        });
+      }
+    });
+
+    if (newProjects.length > 0) {
+      setProjects(prev => [...newProjects, ...prev]);
+      showToast(`ดึงชื่อโครงการจากบิลเข้าทะเบียนเพิ่ม ${newProjects.length} โครงการเรียบร้อยแล้ว`);
+    }
+  };
+
+  const handleCreateOrderForProject = (projectName: string, location?: string, manager?: string) => {
+    const today = new Date().toISOString().split('T')[0];
+    const trPrefix = systemSettings.trPrefix || `TR-${new Date().getFullYear()}-`;
+    const draftOrder: Partial<OrderRecord> = {
+      id: 'ord-' + Date.now(),
+      docType: 'delivery_order',
+      col1: `${trPrefix}${String(orders.length + 1).padStart(3, '0')}`,
+      col2: projectName,
+      col3: 'งานวัสดุก่อสร้าง',
+      col7: today,
+      col9: manager || currentUser.fullName,
+      col23: 'ตัน',
+      col30: 'เครดิต 30 วัน',
+      col37: location || ''
+    };
+    setVerifyOrderData(draftOrder);
+    setVerifyImage(null);
+    setVerifyStoreSuggestion(undefined);
+    setIsVerifyOpen(true);
+  };
+
+  // Open Verification / PO Modal from LINE OA Bot Inbox
+  const handleOpenVerifyFromInbox = (item: LineBillInboxItem) => {
+    const dataWithLineMeta: Partial<OrderRecord> = {
+      ...item.extractedData,
+      docType: item.detectedDocType,
+      col2: item.extractedData?.col2 || '', // Strictly never auto-fill col2 with lineGroupName
+      lineInboxId: item.id,
+      lineMessageId: item.lineMessageId,
+      lineUserId: item.lineUserId,
+      lineSenderName: item.lineSenderName,
+      lineSenderAvatar: item.lineSenderAvatar,
+      lineGroupId: item.lineGroupId,
+      lineGroupName: item.lineGroupName,
+      lineReceivedAt: item.receivedAt,
+      rawAiSnapshot: item.rawAiSnapshot,
+      image: item.image
+    };
+
+    if (item.detectedDocType === 'purchase_order') {
+      const draftPO = convertOrderDraftToPODraft(dataWithLineMeta, item.image);
+      setEditingPO(draftPO);
+      setIsPOEditOpen(true);
+      return;
+    }
+
+    setVerifyOrderData(dataWithLineMeta);
+    setVerifyImage(item.image || null);
+    setVerifyStoreSuggestion(item.storeSuggestion);
+    setIsVerifyOpen(true);
+  };
+
+  // Project count strictly from registered projects in `projects`
+  const totalUniqueProjectsCount = projects.length;
+
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-800 flex flex-col font-sans">
-      
-      {/* Top Navigation */}
-      <Header
+    <div className="min-h-screen bg-slate-50 text-slate-800 flex font-sans">
+      {/* Left Navigation Sidebar */}
+      <SidebarNav
         activeTab={activeTab}
         setActiveTab={setActiveTab}
-        onOpenScan={() => setIsScanOpen(true)}
-        onAddNewOrder={handleAddNewOrder}
-        onAddNewStore={() => {
-          setEditingStore(null);
-          setIsStoreEditOpen(true);
-        }}
-        onAddNewPO={() => handleOpenCreatePO()}
-        onExportExcel={handleExportExcel}
-        totalOrders={orders.length}
+        totalOrders={orders.filter(o => o.docType !== 'dest_weighbridge' && o.docType !== 'tax_invoice').length}
         totalPOs={pos.length}
+        totalDestWB={orders.filter(o => o.docType === 'dest_weighbridge').length}
+        unmatchedDestWB={orders.filter(o => o.docType === 'dest_weighbridge' && !o.linkedViaDocNo).length}
+        totalTaxInv={orders.filter(o => o.docType === 'tax_invoice').length}
+        unmatchedTaxInv={orders.filter(o => o.docType === 'tax_invoice' && !o.linkedViaDocNo).length}
+        totalLineInbox={lineInbox.length}
+        pendingLineInbox={lineInbox.filter(i => i.status === 'pending_review' || i.status === 'queued').length}
         totalStores={stores.length}
+        totalProjects={totalUniqueProjectsCount}
+        isCollapsed={isSidebarCollapsed}
+        onToggleCollapse={() => setIsSidebarCollapsed(prev => !prev)}
+        isMobileOpen={isMobileMenuOpen}
+        onCloseMobile={() => setIsMobileMenuOpen(false)}
+        currentUser={currentUser}
+        currentPermissions={currentPermissions}
+        onOpenLoginModal={() => setIsLoginModalOpen(true)}
+        companyName={systemSettings.companyName}
+        companyLogoUrl={systemSettings.companyLogoUrl}
       />
 
-      {/* Main Container */}
-      <main className="flex-1 max-w-[1920px] w-full mx-auto p-3 md:p-4 space-y-4">
-        
-        {/* KPI Statistics Bar with Quick Filter Interaction */}
-        <StatSummaryCards 
-          orders={orders} 
-          onFilterClick={(type) => {
-            setActiveTab('orders');
-            setTableExternalFilter(type === 'all' ? '' : type);
+      {/* Right Content Area */}
+      <div className="flex-1 flex flex-col min-w-0">
+        {/* Top Action Bar */}
+        <Header
+          activeTab={activeTab}
+          setActiveTab={setActiveTab}
+          onOpenScan={() => setIsScanOpen(true)}
+          onOpenScanPO={() => setIsScanOpen(true)}
+          onAddNewOrder={handleAddNewOrder}
+          onAddNewStore={() => {
+            setEditingStore(null);
+            setIsStoreEditOpen(true);
           }}
+          onAddNewPO={() => handleOpenCreatePO()}
+          onAddNewProject={() => {
+            setActiveTab('projects');
+            setTriggerCreateProjectCounter(c => c + 1);
+          }}
+          onExportExcel={handleExportExcel}
+          totalOrders={orders.filter(o => o.docType !== 'dest_weighbridge' && o.docType !== 'tax_invoice').length}
+          totalPOs={pos.length}
+          totalDestWB={orders.filter(o => o.docType === 'dest_weighbridge').length}
+          unmatchedDestWB={orders.filter(o => o.docType === 'dest_weighbridge' && !o.linkedViaDocNo).length}
+          totalTaxInv={orders.filter(o => o.docType === 'tax_invoice').length}
+          unmatchedTaxInv={orders.filter(o => o.docType === 'tax_invoice' && !o.linkedViaDocNo).length}
+          totalLineInbox={lineInbox.length}
+          pendingLineInbox={lineInbox.filter(i => i.status === 'pending_review' || i.status === 'queued').length}
+          totalStores={stores.length}
+          totalProjects={totalUniqueProjectsCount}
+          onToggleMobileMenu={() => setIsMobileMenuOpen(prev => !prev)}
+          currentUser={currentUser}
+          currentPermissions={currentPermissions}
+          notifications={notifications}
+          dismissedNotifIds={dismissedNotifIds}
+          onDismissNotification={(id) => setDismissedNotifIds(prev => [...prev, id])}
+          onClearDismissedNotifications={() => setDismissedNotifIds([])}
+          onOpenLoginModal={() => setIsLoginModalOpen(true)}
         />
 
-        {/* Tab 1: ตั๋วชั่ง & บิลส่งของ (39 Columns Logistics Table) */}
-        {activeTab === 'orders' && (
-          <TableView39Cols
-            orders={orders}
-            stores={stores}
-            onInspectOrder={handleInspectOrder}
-            onDuplicateOrder={handleDuplicateOrder}
-            onDeleteOrder={handleDeleteOrder}
-            onUpdateOrder={handleUpdateOrder}
-            onOpenStoreModal={handleOpenStoreByName}
-            onOpenScan={() => setIsScanOpen(true)}
-            externalFilter={tableExternalFilter}
-          />
-        )}
+        {/* Main Container */}
+        <main className="flex-1 max-w-[1920px] w-full mx-auto p-3 md:p-4 space-y-4 overflow-x-hidden">
+          {/* KPI Statistics Bar shown ONLY on DO (39-Col) & Analytics views */}
+          {(activeTab === 'orders' || activeTab === 'analytics') && (
+            <StatSummaryCards
+              orders={orders}
+              onFilterClick={(type) => {
+                setActiveTab('orders');
+                setTableExternalFilter(type === 'all' ? '' : type);
+              }}
+            />
+          )}
 
-        {/* Tab 2: ใบสั่งซื้อ (Purchase Orders / POs) */}
-        {activeTab === 'pos' && (
-          <POManagementView
-            pos={pos}
-            orders={orders}
-            stores={stores}
-            onOpenCreatePO={() => handleOpenCreatePO()}
-            onOpenScanPO={() => setIsPOScanOpen(true)}
-            onSelectPO={(po) => setSelectedPOForDetail(po)}
-            onEditPO={(po) => {
-              setEditingPO(po);
-              setIsPOEditOpen(true);
-            }}
-            onDeletePO={handleDeletePO}
-            onAddTicketForPO={handleAddTicketForPO}
-          />
-        )}
+          {/* Menu 0: กล่องพักบิลจาก LINE OA Bot */}
+          {activeTab === 'line_inbox' && (
+            <LineInboxView
+              inboxItems={lineInbox}
+              orders={orders}
+              pos={pos}
+              onUpdateInboxItem={(updated) => {
+                setLineInbox(prev => prev.map(i => (i.id === updated.id ? updated : i)));
+              }}
+              onAddInboxItems={(newItems) => {
+                setLineInbox(prev => [...newItems, ...prev]);
+              }}
+              onDeleteInboxItem={(id) => {
+                if (!currentPermissions.canDeleteOrder) {
+                  showToast(`🚫 บัญชีของคุณ (${currentPermissions.label}) ไม่มีสิทธิ์ลบรายการในกล่องพัก`, 'info');
+                  return;
+                }
+                setLineInbox(prev => prev.filter(i => i.id !== id));
+                showToast('ลบรายการออกจากกล่องพักบิล LINE แล้ว');
+              }}
+              onOpenVerifyFromInbox={handleOpenVerifyFromInbox}
+              onSyncWebhookQueue={syncWebhookQueueToLocal}
+              showToast={showToast}
+            />
+          )}
 
-        {/* Tab 3: Stores & Vendors Directory */}
-        {activeTab === 'stores' && (
-          <StoresManagementView
-            stores={stores}
-            orders={orders}
-            onSelectStore={(st) => setSelectedStoreForDetail(st)}
-            onAddNewStore={() => {
-              setEditingStore(null);
-              setIsStoreEditOpen(true);
-            }}
-            onAddNewOrderForStore={handleAddNewOrderForStore}
-          />
-        )}
+          {/* Menu 1, 3, 4: ใบส่งของ (39 Cols) | ตั๋วชั่งปลายทาง | ใบเสร็จ/กำกับภาษี */}
+          {(activeTab === 'orders' || activeTab === 'dest_wb' || activeTab === 'tax_inv') && (
+            <TableView39Cols
+              viewMode={activeTab}
+              onSwitchTab={(tab) => setActiveTab(tab)}
+              orders={orders}
+              pos={pos}
+              stores={stores}
+              onInspectOrder={handleInspectOrder}
+              onDuplicateOrder={handleDuplicateOrder}
+              onDeleteOrder={handleDeleteOrder}
+              onUpdateOrder={handleUpdateOrder}
+              onLinkOrderToPO={handleLinkOrderToPO}
+              onUnlinkOrderFromPO={handleUnlinkOrderFromPO}
+              onVerifyAutoFlags={handleVerifyOrderAutoFlags}
+              onOpenStoreModal={handleOpenStoreByName}
+              onOpenScan={() => setIsScanOpen(true)}
+              externalFilter={tableExternalFilter}
+            />
+          )}
 
-        {/* Tab 4: Analytics & Financial Insights */}
-        {activeTab === 'analytics' && (
-          <AnalyticsView
-            orders={orders}
-            stores={stores}
-          />
-        )}
+          {/* Menu 2: ใบสั่งซื้อ (Purchase Orders / POs) */}
+          {activeTab === 'pos' && (
+            <POManagementView
+              pos={pos}
+              orders={orders}
+              stores={stores}
+              onOpenCreatePO={() => handleOpenCreatePO()}
+              onOpenScanPO={() => setIsScanOpen(true)}
+              onSelectPO={(po) => setSelectedPOForDetail(po)}
+              onEditPO={(po) => {
+                setEditingPO(po);
+                setIsPOEditOpen(true);
+              }}
+              onDeletePO={handleDeletePO}
+              onAddTicketForPO={handleAddTicketForPO}
+            />
+          )}
 
-      </main>
+          {/* Menu 5: วิเคราะห์ & การเงิน */}
+          {activeTab === 'analytics' && (
+            <AnalyticsView
+              orders={orders}
+              stores={stores}
+            />
+          )}
 
-      {/* AI Scan Modal for Bills & Tickets */}
-      <ScanModal
-        isOpen={isScanOpen}
-        onClose={() => setIsScanOpen(false)}
-        onScanComplete={handleScanComplete}
+          {/* Menu 5.5: ออกรายงาน Excel / PDF */}
+          {activeTab === 'reports' && (
+            <ReportsExportView
+              orders={orders}
+              pos={pos}
+              stores={stores}
+              projects={projects}
+              systemSettings={systemSettings}
+              currentUser={currentUser}
+              canViewFinancials={currentPermissions.canViewFinancials}
+              showToast={showToast}
+            />
+          )}
+
+          {/* Menu 6: ทะเบียนร้านค้า */}
+          {activeTab === 'stores' && (
+            <StoresManagementView
+              stores={stores}
+              orders={orders}
+              pos={pos}
+              onSelectStore={(st) => setSelectedStoreForDetail(st)}
+              onAddNewStore={() => {
+                setEditingStore(null);
+                setIsStoreEditOpen(true);
+              }}
+              onEditStore={(st) => {
+                setEditingStore(st);
+                setIsStoreEditOpen(true);
+              }}
+              onDeleteStore={handleDeleteStore}
+              onAddNewOrderForStore={handleAddNewOrderForStore}
+              onSyncStoresFromBills={handleSyncStoresFromBills}
+            />
+          )}
+
+          {/* Menu 7: ทะเบียนโครงการ */}
+          {activeTab === 'projects' && (
+            <ProjectsManagementView
+              projects={projects}
+              orders={orders}
+              pos={pos}
+              triggerCreateCounter={triggerCreateProjectCounter}
+              onSaveProject={handleSaveProject}
+              onDeleteProject={handleDeleteProject}
+              onFilterOrdersByProject={(projectName) => {
+                setActiveTab('orders');
+                setTableExternalFilter(projectName);
+              }}
+              onCreateOrderForProject={handleCreateOrderForProject}
+              onSyncProjectsFromBills={handleSyncProjectsFromBills}
+            />
+          )}
+
+          {/* Menu 8: ผู้ใช้งาน & กำหนดสิทธิ์ (Users & Roles) */}
+          {activeTab === 'users' && (
+            <UsersRolesView
+              users={users}
+              currentUser={currentUser}
+              rolePermissions={rolePermissions}
+              projects={projects}
+              orders={orders}
+              pos={pos}
+              onSaveUser={handleSaveUser}
+              onToggleUserStatus={handleToggleUserStatus}
+              onSwitchCurrentUser={handleLoginSuccess}
+              onUpdateRolePermissions={(updated) => {
+                setRolePermissions(updated);
+                showToast('บันทึกตารางกำหนดสิทธิ์ (Role & Permission) เรียบร้อยแล้ว');
+              }}
+              showToast={showToast}
+            />
+          )}
+
+          {/* Menu 9: ตั้งค่าระบบ & สำรอง/กู้คืนข้อมูล (System Settings & Backup) */}
+          {activeTab === 'settings' && (
+            <SystemSettingsView
+              systemSettings={systemSettings}
+              orders={orders}
+              pos={pos}
+              stores={stores}
+              projects={projects}
+              lineInbox={lineInbox}
+              users={users}
+              currentUser={currentUser}
+              rolePermissions={rolePermissions}
+              onUpdateSettings={setSystemSettings}
+              onRestoreBackup={handleRestoreBackup}
+              showToast={showToast}
+            />
+          )}
+        </main>
+      </div>
+
+      {/* Login & Quick User Role Switcher Modal */}
+      <LoginModal
+        isOpen={isLoginModalOpen}
+        canClose={true}
+        users={users}
+        currentUser={currentUser}
+        rolePermissions={rolePermissions}
+        companyName={systemSettings.companyName}
+        companyLogoUrl={systemSettings.companyLogoUrl}
+        onLoginSuccess={handleLoginSuccess}
+        onClose={() => setIsLoginModalOpen(false)}
       />
 
-      {/* AI Scan Modal for Purchase Orders (POs) */}
-      <POScanModal
-        isOpen={isPOScanOpen}
-        onClose={() => setIsPOScanOpen(false)}
-        onScanComplete={handlePOScanComplete}
+      {/* Unified AI Scan Modal for All Document Types (DO, PO, Dest Weighbridge, Tax Invoice) */}
+      <ScanModal
+        isOpen={isScanOpen}
+        defaultDocType={
+          activeTab === 'dest_wb' ? 'dest_weighbridge' :
+          activeTab === 'tax_inv' ? 'tax_invoice' :
+          activeTab === 'pos' ? 'purchase_order' :
+          'delivery_order'
+        }
+        existingOrders={orders}
+        existingPOs={pos}
+        onInspectExistingOrder={handleInspectOrder}
+        onInspectExistingPO={(po) => {
+          setEditingPO(po);
+          setIsPOEditOpen(true);
+        }}
+        onClose={() => setIsScanOpen(false)}
+        onScanComplete={handleScanComplete}
+        onPOScanComplete={handlePOScanComplete}
       />
 
       {/* Split Screen Verification Modal for Bills */}
@@ -761,6 +2193,7 @@ export default function App() {
         billImage={verifyImage}
         storeSuggestion={verifyStoreSuggestion}
         stores={stores}
+        projects={projects}
         pos={pos}
         existingOrders={orders}
         onClose={() => setIsVerifyOpen(false)}
@@ -773,6 +2206,7 @@ export default function App() {
         isOpen={Boolean(selectedPOForDetail)}
         po={selectedPOForDetail}
         orders={orders}
+        systemSettings={systemSettings}
         onClose={() => setSelectedPOForDetail(null)}
         onEditPO={(po) => {
           setSelectedPOForDetail(null);
@@ -790,6 +2224,9 @@ export default function App() {
         isOpen={isPOEditOpen}
         po={editingPO}
         stores={stores}
+        projects={projects}
+        existingPOs={pos}
+        existingOrders={orders}
         initialStoreName={initialStoreNameForPO}
         onClose={() => {
           setIsPOEditOpen(false);
@@ -812,27 +2249,29 @@ export default function App() {
           setEditingStore(st);
           setIsStoreEditOpen(true);
         }}
+        onDeleteStore={handleDeleteStore}
       />
 
       {/* Store Add / Edit Modal */}
       <StoreEditModal
         store={editingStore}
+        existingStores={stores}
         isOpen={isStoreEditOpen}
         onClose={() => {
           setIsStoreEditOpen(false);
           setEditingStore(null);
         }}
         onSave={handleSaveStore}
+        onDelete={handleDeleteStore}
       />
 
       {/* Toast Notification */}
       {toast && (
-        <div className="fixed bottom-5 right-5 z-50 bg-slate-900 text-white px-4 py-3 rounded-xl shadow-xl flex items-center space-x-2 text-xs font-semibold animate-bounce border border-slate-700">
+        <div className="fixed bottom-5 right-5 z-50 bg-slate-900 text-white px-4 py-3 rounded-xl shadow-xl flex items-center space-x-2 text-xs font-semibold animate-bounce border border-slate-700 print:hidden">
           <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
           <span>{toast.message}</span>
         </div>
       )}
-
     </div>
   );
 }

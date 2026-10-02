@@ -1,20 +1,27 @@
-import React, { useState, useEffect } from 'react';
-import { X, Building2, Save } from 'lucide-react';
+import React, { useState, useEffect, useMemo } from 'react';
+import { X, Building2, Save, Trash2 } from 'lucide-react';
 import { StoreMerchant } from '../types';
+import { buildDatabaseCatalog, STANDARD_CONSTRUCTION_CATEGORIES } from '../utils/dbLookup';
+import { SmartDatabaseInput } from './SmartDatabaseInput';
 
 interface StoreEditModalProps {
   store: StoreMerchant | null;
+  existingStores?: StoreMerchant[];
   isOpen: boolean;
   onClose: () => void;
-  onSave: (store: StoreMerchant) => void;
+  onSave: (store: StoreMerchant, oldName?: string) => void;
+  onDelete?: (store: StoreMerchant) => void;
 }
 
 export const StoreEditModal: React.FC<StoreEditModalProps> = ({
   store,
+  existingStores = [],
   isOpen,
   onClose,
-  onSave
+  onSave,
+  onDelete
 }) => {
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const [formData, setFormData] = useState<Partial<StoreMerchant>>({
     name: '',
     category: 'งานหิน/ดิน/ทราย',
@@ -31,6 +38,7 @@ export const StoreEditModal: React.FC<StoreEditModalProps> = ({
   const [goodsInput, setGoodsInput] = useState('');
 
   useEffect(() => {
+    setConfirmDelete(false);
     if (store) {
       setFormData(store);
       setGoodsInput((store.primaryGoods || []).join(', '));
@@ -56,12 +64,16 @@ export const StoreEditModal: React.FC<StoreEditModalProps> = ({
     }
   }, [store, isOpen]);
 
+  const storeCatalogOptions = useMemo(() => {
+    const otherStores = store ? existingStores.filter(s => s.id !== store.id) : existingStores;
+    return buildDatabaseCatalog(otherStores).stores;
+  }, [existingStores, store]);
+
   if (!isOpen) return null;
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!formData.name?.trim()) {
-      alert('กรุณาระบุชื่อร้านค้า / ผู้จำหน่าย');
       return;
     }
 
@@ -89,7 +101,7 @@ export const StoreEditModal: React.FC<StoreEditModalProps> = ({
       notes: formData.notes?.trim() || ''
     };
 
-    onSave(updatedStore);
+    onSave(updatedStore, store?.name);
     onClose();
   };
 
@@ -107,7 +119,7 @@ export const StoreEditModal: React.FC<StoreEditModalProps> = ({
               <h3 className="text-base font-bold text-slate-900">
                 {store ? 'แก้ไขข้อมูลร้านค้า / คู่ค้า' : 'เพิ่มร้านค้า / คู่ค้าใหม่'}
               </h3>
-              <p className="text-xs text-slate-500">บันทึกข้อมูลและประวัติผู้จำหน่ายลงในระบบอัตโนมัติ</p>
+              <p className="text-xs text-slate-500">บันทึกข้อมูลและประวัติผู้จำหน่ายลงในระบบอัตโนมัติ (หากเปลี่ยนชื่อร้าน ระบบจะอัปเดตบิลและ PO ที่ผูกไว้ให้ตรงกัน)</p>
             </div>
           </div>
           <button
@@ -124,11 +136,14 @@ export const StoreEditModal: React.FC<StoreEditModalProps> = ({
             <label className="block font-semibold text-slate-700 mb-1">
               ชื่อร้านค้า / บริษัทผู้จำหน่าย <span className="text-rose-500">*</span>
             </label>
-            <input
-              type="text"
+            <SmartDatabaseInput
               required
               value={formData.name || ''}
-              onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+              onChange={(val) => setFormData({ ...formData, name: val })}
+              options={storeCatalogOptions}
+              isStoreField={true}
+              showStatusBadge={true}
+              fieldLabel="ร้านค้า"
               placeholder="เช่น บจก. โรงโม่หิน รุ่งเรืองนคร"
               className="w-full p-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none text-xs"
             />
@@ -136,18 +151,17 @@ export const StoreEditModal: React.FC<StoreEditModalProps> = ({
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
-              <label className="block font-semibold text-slate-700 mb-1">หมวดหมู่หลัก</label>
+              <label className="block font-semibold text-slate-700 mb-1">หมวดหมู่หลัก (งานก่อสร้าง/ถนน/สะพาน/ทล.)</label>
               <select
-                value={formData.category || 'งานหิน/ดิน/ทราย'}
+                value={formData.category || STANDARD_CONSTRUCTION_CATEGORIES[0].value}
                 onChange={(e) => setFormData({ ...formData, category: e.target.value })}
                 className="w-full p-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none"
               >
-                <option value="งานหิน/ดิน/ทราย">งานหิน/ดิน/ทราย</option>
-                <option value="งานเหล็กโครงสร้าง">งานเหล็กโครงสร้าง</option>
-                <option value="งานคอนกรีตผสมเสร็จ">งานคอนกรีตผสมเสร็จ</option>
-                <option value="วัสดุก่อสร้างทั่วไป">วัสดุก่อสร้างทั่วไป</option>
-                <option value="ท่อและระบบประปา">ท่อและระบบประปา</option>
-                <option value="งานขนส่ง/โลจิสติกส์">งานขนส่ง/โลจิสติกส์</option>
+                {STANDARD_CONSTRUCTION_CATEGORIES.map(cat => (
+                  <option key={cat.value} value={cat.value}>
+                    {cat.value}
+                  </option>
+                ))}
                 <option value="อื่นๆ">อื่นๆ</option>
               </select>
             </div>
@@ -248,21 +262,60 @@ export const StoreEditModal: React.FC<StoreEditModalProps> = ({
           </div>
 
           {/* Action buttons */}
-          <div className="flex items-center justify-end space-x-2 pt-3 border-t border-slate-100">
-            <button
-              type="button"
-              onClick={onClose}
-              className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-medium transition cursor-pointer"
-            >
-              ยกเลิก
-            </button>
-            <button
-              type="submit"
-              className="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-bold transition flex items-center gap-1.5 shadow-sm cursor-pointer"
-            >
-              <Save className="w-4 h-4" />
-              <span>บันทึกข้อมูลร้านค้า</span>
-            </button>
+          <div className="flex items-center justify-between pt-3 border-t border-slate-100">
+            <div>
+              {store && onDelete && (
+                confirmDelete ? (
+                  <div className="flex items-center gap-1.5 bg-rose-50 border border-rose-200 px-2.5 py-1.5 rounded-lg">
+                    <span className="text-rose-700 font-semibold text-[11px]">ยืนยันลบร้านค้านี้?</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onDelete(store);
+                        setConfirmDelete(false);
+                        onClose();
+                      }}
+                      className="px-2 py-1 bg-rose-600 hover:bg-rose-700 text-white rounded text-[11px] font-bold cursor-pointer"
+                    >
+                      ยืนยันลบ
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConfirmDelete(false)}
+                      className="px-2 py-1 text-slate-600 hover:text-slate-900 text-[11px] font-medium cursor-pointer"
+                    >
+                      ยกเลิก
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setConfirmDelete(true)}
+                    className="px-3 py-2 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded-lg font-semibold transition flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>ลบร้านค้านี้</span>
+                  </button>
+                )
+              )}
+            </div>
+
+            <div className="flex items-center space-x-2">
+              <button
+                type="button"
+                onClick={onClose}
+                className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-medium transition cursor-pointer"
+              >
+                ยกเลิก
+              </button>
+              <button
+                type="submit"
+                className="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-bold transition flex items-center gap-1.5 shadow-sm cursor-pointer"
+              >
+                <Save className="w-4 h-4" />
+                <span>บันทึกข้อมูลร้านค้า</span>
+              </button>
+            </div>
           </div>
         </form>
 

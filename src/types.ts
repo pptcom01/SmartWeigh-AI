@@ -85,7 +85,29 @@ export interface OrderRecord {
   aiExtracted?: boolean;
   storeId?: string;
   createdAt?: string;
+  createdBy?: string;           // ชื่อผู้ใช้งานที่บันทึกบิลเข้าระบบ
+  updatedBy?: string;           // ชื่อผู้ใช้งานที่แก้ไขบิลล่าสุด
   status?: 'verified' | 'pending' | 'flagged';
+
+  // Auto-Matching & Auto-Action Verification Flags (Zones 1-4)
+  poMatchStatus?: 'auto_flagged' | 'verified';   // สถานะการชน PO โซน 1 (auto_flagged = ชนอัตโนมัติรอตรวจสอบ, verified = ยืนยันแล้ว/ชนด้วยมือ)
+  destMatchStatus?: 'auto_flagged' | 'verified'; // สถานะการชนตั๋วปลายทาง โซน 4 (auto_flagged = ชนอัตโนมัติรอตรวจสอบ, verified = ยืนยันแล้ว/ชนด้วยมือ)
+  matchedDestTicketId?: string;                  // ID ของตั๋วชั่งปลายทางที่นำมาชนเข้าโซน 4
+  autoActionFlags?: string[];                    // รายการสิ่งที่ระบบทำให้อัตโนมัติซึ่งติดธงรอให้ผู้ใช้ตรวจสอบและยืนยัน
+  autoFlagsVerified?: boolean;                   // ผู้ใช้งานกดตรวจสอบและยืนยันรายการอัตโนมัติแล้วหรือยัง
+  autoFlagsVerifiedBy?: string;                  // ชื่อผู้ใช้งานที่กดยืนยันความถูกต้อง
+  autoFlagsVerifiedAt?: string;                  // วัน-เวลาที่กดยืนยันความถูกต้อง
+
+  // LINE OA Bot Metadata (Stored strictly separate from col2 Project Name)
+  lineInboxId?: string;
+  lineMessageId?: string;
+  lineUserId?: string;
+  lineSenderName?: string;      // ชื่อผู้ส่งบิลใน LINE (เช่น ช่างสมชาย)
+  lineSenderAvatar?: string;    // รูปโปรไฟล์ผู้ส่งใน LINE
+  lineGroupId?: string;         // รหัสกลุ่ม LINE
+  lineGroupName?: string;       // ชื่อกลุ่ม LINE ที่ส่งบิลเข้ามา (เก็บแยกอิสระ ห้ามผูกเข้า col2 อัตโนมัติ)
+  lineReceivedAt?: string;      // วัน-เวลาที่บอทรับรูปบิลจาก LINE
+  rawAiSnapshot?: Partial<OrderRecord>; // ข้อมูลดิบทุกโซนที่ AI สกัดไว้ครั้งแรก เพื่อสลับประเภทเอกสารได้ทันทีโดยไม่ต้องสแกนใหม่
 }
 
 export interface StoreMerchant {
@@ -106,6 +128,18 @@ export interface StoreMerchant {
   lastOrderDate?: string;
   primaryGoods: string[];
   notes?: string;
+}
+
+export interface ProjectRecord {
+  id: string;
+  name: string;
+  code?: string;
+  location?: string;
+  manager?: string;
+  budget?: number;
+  status?: 'active' | 'completed' | 'on_hold';
+  notes?: string;
+  createdAt?: string;
 }
 
 export type POStatus = 'pending' | 'partially_delivered' | 'completed' | 'cancelled';
@@ -141,6 +175,15 @@ export interface PurchaseOrder {
   image?: string | null;          // ภาพเอกสารใบสั่งซื้อต้นฉบับ
   createdAt: string;
   updatedAt: string;
+
+  // LINE OA Bot Metadata (Stored strictly separate from projectId)
+  lineInboxId?: string;
+  lineMessageId?: string;
+  lineUserId?: string;
+  lineSenderName?: string;
+  lineGroupId?: string;
+  lineGroupName?: string;
+  lineReceivedAt?: string;
 }
 
 export interface ConvertedOrderUnitDetail {
@@ -205,4 +248,159 @@ export interface ScanApiResponse {
   notes?: string;
   confidence?: number;
   error?: string;
+  isBillDocument?: boolean;
 }
+
+export type LineInboxItemStatus =
+  | 'queued'             // เพิ่งรับรูปเข้าคิว กำลังรอ AI สแกน
+  | 'pending_review'     // AI สแกนเสร็จแล้ว รอผู้ตรวจสอบตรวจทานและระบุชื่อโครงการ (ช่อง 2)
+  | 'duplicate_warning'  // AI ตรวจพบว่าเลขบิล+ร้านค้าซ้ำกับบิลที่มีอยู่แล้ว
+  | 'verified'           // ผู้ตรวจสอบกดยืนยันบันทึกเข้าตารางหลัก 39 คอลัมน์ / PO แล้ว
+  | 'ignored_non_bill'   // AI คัดกรองแล้วว่าเป็นรูปถ่ายทั่วไปในกลุ่ม (ไม่ใช่บิล)
+  | 'scan_failed';       // AI อ่านไม่สำเร็จ แต่เก็บรูปและชื่อผู้ส่งไว้ครบ รอกดสแกนซ้ำหรือคีย์มือ
+
+export interface LineBillInboxItem {
+  id: string;
+  lineMessageId: string;
+  lineQuoteToken?: string;
+  lineReplyToken?: string;
+  lineUserId: string;
+  lineSenderName: string;          // ชื่อผู้ส่งใน LINE
+  lineSenderAvatar?: string;
+  lineGroupId?: string;
+  lineGroupName: string;           // ชื่อกลุ่ม LINE (เก็บแยกจาก col2 ชื่อโครงการ 100%)
+  receivedAt: string;              // วัน-เวลาที่ส่งเข้ากลุ่ม LINE (ISO)
+  image: string;                   // Base64 image data
+  status: LineInboxItemStatus;
+  detectedDocType: DocumentType;   // ประเภทเอกสารที่ AI จำแนก (หรือที่ผู้ตรวจสอบสลับเปลี่ยน)
+  extractedData: Partial<OrderRecord>; // ข้อมูลที่พร้อมส่งเข้า VerifyModal / POEditModal (col2 จะว่างไว้ให้ผู้ตรวจระบุ)
+  rawAiSnapshot: Partial<OrderRecord>; // ข้อมูลดิบครบทุกโซนจาก AI เพื่อรองรับการสลับประเภทบิลทันทีโดยไม่ต้องสแกนใหม่
+  storeSuggestion?: Partial<StoreMerchant>;
+  aiConfidence?: number;
+  isBillDocument: boolean;
+  nonBillReason?: string;
+  botReplyText?: string;           // ข้อความที่บอท Quote Reply ตอบกลับอ้างอิงภาพบิลในกลุ่ม LINE
+  botReplySent?: boolean;
+  duplicateInfo?: {
+    isDuplicate: boolean;
+    matchedCode?: string;          // เช่น TR-2026-101 หรือรหัสคิวเดิม
+    matchedBillNo?: string;
+    matchedVendor?: string;
+    reason?: string;
+  };
+  verifiedOrderId?: string;        // รหัสบิลที่บันทึกจริงเมื่อตรวจเสร็จ
+  verifiedBy?: string;
+  verifiedAt?: string;
+}
+
+export interface LineBotConfig {
+  enabled: boolean;
+  channelAccessToken: string;
+  channelSecret: string;
+  autoQuoteReply: boolean;         // ตอบกลับอ้างอิงรูปบิลด้วย replyToken + quoteToken (ฟรี 0 โควตา)
+  replyOnDuplicate: boolean;       // แจ้งเตือนในกลุ่มทันทีเมื่อส่งบิลซ้ำ
+  replyOnUnclearImage: boolean;    // แจ้งยืนยันรับรูปเข้ากล่องพักแม้เลขบิลไม่ชัด
+  filterNonBillImages: boolean;    // คัดกรองรูปทั่วไปที่ไม่ใช่บิลออกอัตโนมัติ
+  strictZeroPushQuota: boolean;    // บล็อกการใช้ Push Message 100% เพื่อไม่ให้กินโควตารายเดือน
+  allowedGroupNames: string[];     // รายชื่อกลุ่ม LINE ที่ตั้งรับบิล (ถ้าว่าง = รับทุกกลุ่มที่เชิญบอทเข้า)
+}
+
+// ============================================================================
+// USER AUTHENTICATION, ROLE PERMISSIONS, SYSTEM SETTINGS & NOTIFICATIONS
+// ============================================================================
+
+export type UserRole = 'admin' | 'manager' | 'user';
+
+export interface AppUser {
+  id: string;
+  username: string;
+  password: string;
+  fullName: string;
+  position: string;
+  phone?: string;
+  role: UserRole;
+  assignedProjects: string[];      // ว่าง = เข้าถึงได้ทุกโครงการ
+  status: 'active' | 'suspended';  // ห้ามลบถาวรเพื่อรักษาประวัติ Audit Trail ในบิลเก่า
+  isSystemMaster?: boolean;        // บัญชี Master หลักที่ฝังติดกับระบบถาวร (ห้ามลบ/ห้ามระงับ)
+  createdAt: string;
+  lastLoginAt?: string;
+}
+
+export interface RolePermissions {
+  role: UserRole;
+  label: string;
+  badgeColor: string;
+  description: string;
+  allowedTabs: string[];           // เมนูที่อนุญาตให้เข้าถึง
+  canCreateOrder: boolean;         // สแกน/เพิ่มบิลใหม่
+  canEditOrder: boolean;           // แก้ไขข้อมูลบิล
+  canDeleteOrder: boolean;         // ลบบิล/ลบรายการ
+  canViewFinancials: boolean;      // ดูและแก้ไขราคา/การชำระเงิน (โซน 5-6)
+  canManagePO: boolean;            // เปิด/แก้ไข/อนุมัติใบสั่งซื้อ (PO)
+  canExportReport: boolean;        // ส่งออกรายงาน Excel / PDF
+  canManageUsers: boolean;         // จัดการผู้ใช้งานและสิทธิ์
+  canManageSettings: boolean;      // ตั้งค่าระบบและสำรอง/กู้คืนข้อมูล
+}
+
+export interface SystemSettings {
+  companyName: string;
+  companySubtitle: string;
+  companyAddress: string;
+  companyTaxId: string;
+  companyPhone: string;
+  companyEmail?: string;
+  companyLogoUrl?: string;
+  trPrefix: string;                // เช่น TR-2026-
+  poPrefix: string;                // เช่น PO-2026-
+  defaultVatPercent: number;       // เช่น 7
+  weightDiffAlertKg: number;       // เกณฑ์เตือนผลต่างน้ำหนักต้นทาง-ปลายทาง (กก.) เช่น 50 กก.
+  weightDiffAlertPercent: number;  // เกณฑ์เตือนผลต่างน้ำหนัก (%) เช่น 1.5%
+  poQuotaAlertPercent: number;     // เกณฑ์เตือนโควตา PO ใกล้เต็ม (%) เช่น 90%
+  unlinkedDOAlertDays: number;     // เกณฑ์เตือน DO ที่ยังไม่ชน PO (วัน) เช่น 7 วัน
+  backupReminderDays: number;      // เตือนสำรองข้อมูลทุกกี่วัน เช่น 7 วัน
+  lastBackupAt?: string;           // วัน-เวลาที่สำรองข้อมูลล่าสุด
+  customCategories: string[];      // หมวดหมู่วัสดุมาตรฐานที่ปรับเพิ่ม/ลบได้โดยไม่ต้องแก้โค้ด
+  customUnits: string[];           // หน่วยนับมาตรฐานที่ปรับเพิ่ม/ลบได้โดยไม่ต้องแก้โค้ด
+  reportSignatoryPreparedBy: string; // ตำแหน่งช่องเซ็นผู้จัดทำ
+  reportSignatoryCheckedBy: string;  // ตำแหน่งช่องเซ็นผู้ตรวจสอบ
+  reportSignatoryApprovedBy: string; // ตำแหน่งช่องเซ็นผู้อนุมัติ
+  requireLoginOnStart: boolean;    // บังคับล็อกอินก่อนเข้าใช้งาน
+}
+
+export interface SystemNotification {
+  id: string;
+  type: 'line_inbox' | 'duplicate' | 'weight_diff' | 'po_quota' | 'unlinked_doc' | 'backup_reminder' | 'auto_flag';
+  severity: 'critical' | 'warning' | 'info';
+  title: string;
+  message: string;
+  targetTab: string;
+  relatedId?: string;
+  createdAt: string;
+}
+
+export interface SystemBackupPayload {
+  version: string;
+  exportedAt: string;
+  exportedBy: string;
+  companyName: string;
+  counts: {
+    orders: number;
+    pos: number;
+    stores: number;
+    projects: number;
+    lineInbox: number;
+    users: number;
+  };
+  data: {
+    orders: OrderRecord[];
+    pos: PurchaseOrder[];
+    stores: StoreMerchant[];
+    projects: ProjectRecord[];
+    lineInbox: LineBillInboxItem[];
+    users: AppUser[];
+    rolePermissions: Record<UserRole, RolePermissions>;
+    systemSettings: SystemSettings;
+  };
+}
+
+

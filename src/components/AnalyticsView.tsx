@@ -18,10 +18,29 @@ interface AnalyticsViewProps {
 }
 
 export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ orders, stores }) => {
+  // Effective orders for spend calculation (exclude dest_weighbridge and duplicate tax_invoice where store already has priced DOs)
+  const effectivePurchaseOrders = useMemo(() => {
+    const storesWithPricedDeliveries = new Set(
+      orders
+        .filter(r => r.docType !== 'tax_invoice' && r.docType !== 'dest_weighbridge' && (Number(r.col29) > 0 || Number(r.col25) > 0))
+        .map(r => (r.storeId || r.col8 || '').trim().toLowerCase())
+        .filter(Boolean)
+    );
+    return orders.filter(o => {
+      if (o.docType === 'dest_weighbridge') return false;
+      if (o.docType === 'tax_invoice' && o.linkedViaDocNo) return false;
+      const storeKey = (o.storeId || o.col8 || '').trim().toLowerCase();
+      if (o.docType === 'tax_invoice' && storeKey && storesWithPricedDeliveries.has(storeKey)) {
+        return false;
+      }
+      return true;
+    });
+  }, [orders]);
+
   // 1. Spend by Store
   const storeSpendList = useMemo(() => {
     const map = new Map<string, { total: number; count: number }>();
-    orders.forEach(o => {
+    effectivePurchaseOrders.forEach(o => {
       const name = o.col8 || 'ไม่ระบุร้าน';
       const amt = Number(o.col29) || 0;
       const cur = map.get(name) || { total: 0, count: 0 };
@@ -31,12 +50,12 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ orders, stores }) 
     return Array.from(map.entries())
       .map(([name, data]) => ({ name, ...data }))
       .sort((a, b) => b.total - a.total);
-  }, [orders]);
+  }, [effectivePurchaseOrders]);
 
   // 2. Spend by Category
   const categorySpendList = useMemo(() => {
     const map = new Map<string, number>();
-    orders.forEach(o => {
+    effectivePurchaseOrders.forEach(o => {
       const cat = o.col3 || 'ทั่วไป';
       const amt = Number(o.col29) || 0;
       map.set(cat, (map.get(cat) || 0) + amt);
@@ -45,7 +64,7 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ orders, stores }) 
     const list = Array.from(map.entries()).map(([category, amount]) => ({ category, amount }));
     list.sort((a, b) => b.amount - a.amount);
     return list;
-  }, [orders]);
+  }, [effectivePurchaseOrders]);
 
   // 3. Payment Method Breakdown
   const paymentStats = useMemo(() => {
@@ -54,7 +73,7 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ orders, stores }) 
     let cashTotal = 0;
     let otherTotal = 0;
 
-    orders.forEach(o => {
+    effectivePurchaseOrders.forEach(o => {
       const amt = Number(o.col29) || 0;
       const method = (o.col30 || '').toLowerCase();
       if (method.includes('เครดิต')) {
@@ -69,17 +88,17 @@ export const AnalyticsView: React.FC<AnalyticsViewProps> = ({ orders, stores }) 
     });
 
     return { creditTotal, transferTotal, cashTotal, otherTotal };
-  }, [orders]);
+  }, [effectivePurchaseOrders]);
 
   // 4. Weight Diff / Discrepancy analysis
   const weightDiffOrders = useMemo(() => {
     return orders
-      .filter(o => Number(o.col21) > 0)
+      .filter(o => o.docType !== 'dest_weighbridge' && Number(o.col21) > 0)
       .sort((a, b) => Number(b.col21) - Number(a.col21));
   }, [orders]);
 
   const maxStoreSpend = storeSpendList[0]?.total || 1;
-  const totalSpendAll = orders.reduce((sum, o) => sum + (Number(o.col29) || 0), 0);
+  const totalSpendAll = effectivePurchaseOrders.reduce((sum, o) => sum + (Number(o.col29) || 0), 0);
 
   const fmtCurrency = (num: number) => {
     return '฿' + num.toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });

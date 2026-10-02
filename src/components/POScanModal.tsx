@@ -11,6 +11,7 @@ import { PurchaseOrder } from '../types';
 
 interface POScanModalProps {
   isOpen: boolean;
+  existingPOs?: PurchaseOrder[];
   onClose: () => void;
   onScanComplete: (poData: Partial<PurchaseOrder>, imageBase64: string) => void;
 }
@@ -53,6 +54,7 @@ const optimizeImageForAI = (file: File, maxDim = 1800, quality = 0.85): Promise<
 
 export const POScanModal: React.FC<POScanModalProps> = ({
   isOpen,
+  existingPOs = [],
   onClose,
   onScanComplete
 }) => {
@@ -61,6 +63,11 @@ export const POScanModal: React.FC<POScanModalProps> = ({
   const [isScanning, setIsScanning] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
+
+  const duplicateImagePO = React.useMemo(() => {
+    if (!previewUrl || previewUrl.length < 200) return null;
+    return existingPOs.find(p => p.image && p.image === previewUrl) || null;
+  }, [previewUrl, existingPOs]);
 
   if (!isOpen) return null;
 
@@ -223,6 +230,23 @@ export const POScanModal: React.FC<POScanModalProps> = ({
             )}
           </div>
 
+          {/* Duplicate PO Image Hard Block */}
+          {duplicateImagePO && (
+            <div className="p-3.5 bg-rose-50 border-2 border-rose-500 rounded-xl space-y-2 text-rose-950 animate-fadeIn">
+              <div className="flex items-start gap-2.5">
+                <AlertCircle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+                <div>
+                  <div className="text-xs font-bold text-rose-900">
+                    🚫 บล็อกการนำเข้า: รูปใบสั่งซื้อ (PO) นี้มีอยู่ในระบบแล้ว!
+                  </div>
+                  <p className="text-[11px] text-rose-800 mt-0.5">
+                    ตรงกับใบสั่งซื้อเลขที่ <span className="font-mono font-bold">{duplicateImagePO.poNumber}</span> • ร้าน <span className="font-semibold">{duplicateImagePO.storeName}</span> (ยอด ฿{duplicateImagePO.totalAmount.toLocaleString()})
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Error Message with Retry */}
           {scanError && (
             <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-800 flex items-center justify-between gap-3 animate-fadeIn">
@@ -253,11 +277,13 @@ export const POScanModal: React.FC<POScanModalProps> = ({
             </button>
             <button
               type="button"
-              disabled={!previewUrl || isScanning}
+              disabled={!previewUrl || isScanning || Boolean(duplicateImagePO)}
               onClick={handleStartScan}
-              className="px-5 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white rounded-xl text-xs font-semibold flex items-center gap-2 shadow-xs transition cursor-pointer"
+              className="px-5 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl text-xs font-semibold flex items-center gap-2 shadow-xs transition cursor-pointer"
             >
-              {isScanning ? (
+              {duplicateImagePO ? (
+                <span>🚫 บล็อก: รูป PO นี้ถูกนำเข้าแล้ว</span>
+              ) : isScanning ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
                   <span>Gemini กำลังอ่านใบสั่งซื้อ...</span>

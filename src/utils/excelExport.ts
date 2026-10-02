@@ -53,33 +53,45 @@ export function exportAllDataToExcel(orders: OrderRecord[], stores: StoreMerchan
     // โซน 7
     "37. สถานที่ส่ง / กม.": r.col37 || '',
     "38. หมายเหตุ": r.col38 || '',
-    "สถานะการตรวจ": r.status === 'verified' ? 'ตรวจสอบแล้ว' : 'รอตรวจสอบ'
+    "สถานะการตรวจ": r.status === 'verified' ? 'ตรวจสอบแล้ว' : 'รอตรวจสอบ',
+    "ผู้ส่งบิล (LINE)": r.lineSenderName || '',
+    "กลุ่ม LINE ที่ส่งบิล (แยกจากชื่อโครงการ)": r.lineGroupName || ''
   }));
 
   const orderSheet = XLSX.utils.json_to_sheet(orderRows);
   XLSX.utils.book_append_sheet(workbook, orderSheet, "ประวัติคำสั่งซื้อ_39คอลัมน์");
 
-  // 2. Prepare Stores Sheet with live recalculated metrics from orders
+  // 2. Prepare Stores Sheet with live recalculated metrics from orders (matching syncStoreFinancials)
   const storeRows = stores.map((s, idx) => {
     const storeOrders = orders.filter(
-      o => o.storeId === s.id || (o.col8 && o.col8.trim().toLowerCase() === s.name.trim().toLowerCase())
+      o => (o.storeId === s.id || (o.col8 && o.col8.trim().toLowerCase() === s.name.trim().toLowerCase())) &&
+           o.docType !== 'dest_weighbridge'
+    );
+
+    const hasPricedDeliveryOrder = storeOrders.some(
+      o => o.docType !== 'tax_invoice' && (Number(o.col29) > 0 || Number(o.col25) > 0)
     );
 
     let livePurchases = 0;
     let livePaid = 0;
     let liveDebt = 0;
+    let effectiveOrderCount = 0;
     let liveLastDate = s.lastOrderDate || '-';
 
     storeOrders.forEach(o => {
-      livePurchases += Number(o.col29) || 0;
-      livePaid += Number(o.col35) || 0;
-      liveDebt += Number(o.col36) || 0;
-      if (o.col7 && o.col7 > liveLastDate) {
+      const isDuplicateTaxInvoice = o.docType === 'tax_invoice' && (Boolean(o.linkedViaDocNo) || hasPricedDeliveryOrder);
+      if (!isDuplicateTaxInvoice) {
+        effectiveOrderCount++;
+        livePurchases += Number(o.col29) || Number(o.col25) || 0;
+      }
+      livePaid += Number(o.col35) || Number(o.col31) || 0;
+      liveDebt += Number(o.col36) || Number(o.col32) || 0;
+      if (o.col7 && (liveLastDate === '-' || o.col7 > liveLastDate)) {
         liveLastDate = o.col7;
       }
     });
 
-    const orderCount = storeOrders.length > 0 ? storeOrders.length : s.totalOrders;
+    const orderCount = storeOrders.length > 0 ? effectiveOrderCount : s.totalOrders;
     const finalPurchases = storeOrders.length > 0 ? livePurchases : s.totalPurchases;
     const finalPaid = storeOrders.length > 0 ? livePaid : s.totalPaid;
     const finalDebt = storeOrders.length > 0 ? liveDebt : s.totalDebt;
@@ -151,7 +163,10 @@ export function exportAllDataToExcel(orders: OrderRecord[], stores: StoreMerchan
 
 export function exportStoreStatement(store: StoreMerchant, orders: OrderRecord[]) {
   const workbook = XLSX.utils.book_new();
-  const storeOrders = orders.filter(o => o.col8 === store.name || o.storeId === store.id);
+  const storeOrders = orders.filter(
+    o => (o.storeId === store.id || (o.col8 && o.col8.trim().toLowerCase() === store.name.trim().toLowerCase())) &&
+         o.docType !== 'dest_weighbridge'
+  );
 
   const rows = storeOrders.map((r, idx) => ({
     "ลำดับ": idx + 1,

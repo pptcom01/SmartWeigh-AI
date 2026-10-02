@@ -14,7 +14,9 @@ import {
   TrendingUp,
   AlertCircle,
   Package,
-  Truck
+  Truck,
+  Edit3,
+  Trash2
 } from 'lucide-react';
 import { StoreMerchant, OrderRecord } from '../types';
 import { exportStoreStatement } from '../utils/excelExport';
@@ -27,6 +29,7 @@ interface StoreDetailModalProps {
   onAddNewOrderForStore: (store: StoreMerchant) => void;
   onOpenCreatePOForStore?: (store: StoreMerchant) => void;
   onEditStore: (store: StoreMerchant) => void;
+  onDeleteStore?: (store: StoreMerchant) => void;
 }
 
 export const StoreDetailModal: React.FC<StoreDetailModalProps> = ({
@@ -36,40 +39,54 @@ export const StoreDetailModal: React.FC<StoreDetailModalProps> = ({
   onInspectOrder,
   onAddNewOrderForStore,
   onOpenCreatePOForStore,
-  onEditStore
+  onEditStore,
+  onDeleteStore
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   if (!store) return null;
 
-  // Filter orders related to this store
+  // Filter orders related to this store (excluding unmerged dest_weighbridge)
   const storeOrders = useMemo(() => {
     return orders.filter(o => 
-      o.storeId === store.id || 
-      (o.col8 && o.col8.trim().toLowerCase() === store.name.trim().toLowerCase())
+      (o.storeId === store.id || 
+      (o.col8 && o.col8.trim().toLowerCase() === store.name.trim().toLowerCase())) &&
+      o.docType !== 'dest_weighbridge'
     );
   }, [orders, store]);
 
   // Recalculate dynamic totals from actual orders
   const stats = useMemo(() => {
+    const hasPricedDeliveries = storeOrders.some(
+      o => o.docType !== 'tax_invoice' && (Number(o.col29) > 0 || Number(o.col25) > 0)
+    );
     let totalPurchases = 0;
     let totalPaid = 0;
     let totalDebt = 0;
     let totalNetWeightTons = 0;
+    let validOrderCount = 0;
     const vehiclePlates = new Set<string>();
     const projectNames = new Set<string>();
 
     storeOrders.forEach(o => {
-      totalPurchases += Number(o.col29) || 0;
-      totalPaid += Number(o.col35) || 0;
-      totalDebt += Number(o.col36) || 0;
-      totalNetWeightTons += (Number(o.col15) || 0) / 1000;
+      if (o.docType === 'tax_invoice' && o.linkedViaDocNo) return;
+      if (o.docType === 'tax_invoice' && hasPricedDeliveries) {
+        totalPaid += Number(o.col35) || 0;
+        totalDebt += Number(o.col36) || 0;
+      } else {
+        validOrderCount++;
+        totalPurchases += Number(o.col29) || 0;
+        totalPaid += Number(o.col35) || 0;
+        totalDebt += Number(o.col36) || 0;
+        totalNetWeightTons += (Number(o.col15) || 0) / 1000;
+      }
       if (o.col10) vehiclePlates.add(o.col10);
       if (o.col2) projectNames.add(o.col2);
     });
 
     return {
-      orderCount: storeOrders.length,
+      orderCount: validOrderCount,
       totalPurchases,
       totalPaid,
       totalDebt,
@@ -128,10 +145,42 @@ export const StoreDetailModal: React.FC<StoreDetailModalProps> = ({
           <div className="flex items-center space-x-2">
             <button
               onClick={() => onEditStore(store)}
-              className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-medium transition cursor-pointer border border-slate-700"
+              className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold transition cursor-pointer flex items-center gap-1.5 shadow-xs"
             >
-              แก้ไขข้อมูลร้านค้า
+              <Edit3 className="w-3.5 h-3.5" />
+              <span>แก้ไขข้อมูลร้านค้า</span>
             </button>
+            {onDeleteStore && (
+              confirmDelete ? (
+                <div className="flex items-center gap-1 bg-rose-950/90 border border-rose-500/50 px-2 py-1 rounded-lg">
+                  <span className="text-[11px] text-rose-200 mr-1">ยืนยันลบ?</span>
+                  <button
+                    onClick={() => {
+                      onDeleteStore(store);
+                      setConfirmDelete(false);
+                      onClose();
+                    }}
+                    className="px-2 py-0.5 bg-rose-600 hover:bg-rose-500 text-white rounded text-[11px] font-bold cursor-pointer"
+                  >
+                    ยืนยันลบ
+                  </button>
+                  <button
+                    onClick={() => setConfirmDelete(false)}
+                    className="px-1.5 py-0.5 text-slate-300 hover:text-white text-[11px] cursor-pointer"
+                  >
+                    ยกเลิก
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setConfirmDelete(true)}
+                  className="px-3 py-1.5 bg-rose-950/60 hover:bg-rose-900 text-rose-200 rounded-lg text-xs font-medium transition cursor-pointer border border-rose-800/60 flex items-center gap-1"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>ลบร้านค้า</span>
+                </button>
+              )
+            )}
             <button
               onClick={onClose}
               className="text-slate-400 hover:text-white text-lg w-8 h-8 rounded-full flex items-center justify-center hover:bg-slate-800 transition cursor-pointer"
